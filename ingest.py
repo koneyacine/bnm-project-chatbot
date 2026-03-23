@@ -9,11 +9,11 @@ load_dotenv()
 
 # PostgreSQL connection
 conn = psycopg2.connect(
-    dbname="ma_base_vector",
-    user="postgres",
-    password="Yacine-96",
-    host="localhost",
-    port="5433"
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT")
 )
 cur = conn.cursor()
 
@@ -45,7 +45,8 @@ for file in os.listdir(documents_folder):
         vector = embeddings.embed_query(chunk.page_content)
 
         cur.execute(
-            "INSERT INTO documents (content, source, embedding) VALUES (%s, %s, %s)",
+            "INSERT INTO documents (content, source, embedding) "
+            "VALUES (%s, %s, %s)",
             (chunk.page_content, file, vector)
         )
 

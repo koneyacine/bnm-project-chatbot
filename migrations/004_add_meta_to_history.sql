@@ -1,0 +1,2 @@
+ALTER TABLE conversation_history
+ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT NULL;

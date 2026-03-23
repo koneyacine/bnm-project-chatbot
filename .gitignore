@@ -1,1 +1,28 @@
-.env 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.bak.*
+*.safe_*
+venv/
+.env
+
+# Données sensibles
+conversations/
+uploads/
+conversations_backup/
+
+# Node
+ui/node_modules/
+ui/dist/
+
+# Logs
+*.log
+/tmp/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
