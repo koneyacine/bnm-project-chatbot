@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+
+  gateway:
+    build: ./gateway
+    ports: ["8000:8000"]
+    env_file: ../.env
+    depends_on:
+      - auth-service
+      - chat-service
+      - ticket-service
+      - document-service
+      - admin-service
+    environment:
+      AUTH_SERVICE_URL:     http://auth-service:8001
+      CHAT_SERVICE_URL:     http://chat-service:8002
+      TICKET_SERVICE_URL:   http://ticket-service:8003
+      DOCUMENT_SERVICE_URL: http://document-service:8004
+      ADMIN_SERVICE_URL:    http://admin-service:8005
+
+  auth-service:
+    build: ./auth-service
+    ports: ["8001:8001"]
+    env_file: ../.env
+
+  chat-service:
+    build: ./chat-service
+    ports: ["8002:8002"]
+    env_file: ../.env
+    environment:
+      BNM_DATA_DIR: /app/data
+    volumes:
+      - ../conversations:/app/data/conversations
+      - ../documents:/app/data/documents
+
+  ticket-service:
+    build: ./ticket-service
+    ports: ["8003:8003"]
+    env_file: ../.env
+    environment:
+      BNM_DATA_DIR: /app/data
+    volumes:
+      - ../conversations:/app/data/conversations
+      - ../uploads:/app/data/uploads
+
+  document-service:
+    build: ./document-service
+    ports: ["8004:8004"]
+    env_file: ../.env
+    environment:
+      BNM_DATA_DIR: /app/data
+    volumes:
+      - ../conversations:/app/data/conversations
+      - ../uploads:/app/data/uploads
+
+  admin-service:
+    build: ./admin-service
+    ports: ["8005:8005"]
+    env_file: ../.env
+    environment:
+      BNM_DATA_DIR: /app/data
+    volumes:
+      - ../conversations:/app/data/conversations

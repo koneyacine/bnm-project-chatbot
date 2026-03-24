@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+openai
+langchain-openai
+langchain-core
+langchain-community
+langchain-text-splitters
+python-dotenv
+bcrypt
+python-jose[cryptography]

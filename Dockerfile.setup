@@ -1,0 +1,12 @@
+FROM python:3.10-slim
+WORKDIR /app
+
+RUN pip install --no-cache-dir psycopg2-binary bcrypt python-dotenv
+
+# Copier les migrations SQL et les scripts seed
+COPY migrations/ /app/migrations/
+COPY seed/seed_all.py /app/seed/seed_all.py
+COPY docker-entrypoint-setup.sh /app/docker-entrypoint-setup.sh
+RUN chmod +x /app/docker-entrypoint-setup.sh
+
+ENTRYPOINT ["/app/docker-entrypoint-setup.sh"]

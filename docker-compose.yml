@@ -1,0 +1,189 @@
+version: "3.9"
+
+services:
+
+  # ── Base de données PostgreSQL + pgvector ──────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bnm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-bnm_password}
+      POSTGRES_DB:       ${DB_NAME:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - bnm_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Migration + Seed automatique ──────────────────────────────
+  setup:
+    build:
+      context: .
+      dockerfile: Dockerfile.setup
+    container_name: bnm-setup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_NAME:     ${DB_NAME:-postgres}
+      DB_USER:     ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-bnm_password}
+      DB_HOST:     postgres
+      DB_PORT:     5432
+    restart: "no"
+
+  # ── Auth Service ───────────────────────────────────────────────
+  auth-service:
+    build: ./services/auth-service
+    container_name: bnm-auth
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8001:8001"
+    environment:
+      DB_NAME:              ${DB_NAME:-postgres}
+      DB_USER:              ${DB_USER:-postgres}
+      DB_PASSWORD:          ${DB_PASSWORD:-bnm_password}
+      DB_HOST:              postgres
+      DB_PORT:              5432
+      JWT_SECRET_KEY:       ${JWT_SECRET_KEY:-change_me_in_production}
+      JWT_ALGORITHM:        HS256
+      JWT_EXPIRATION_HOURS: 24
+
+  # ── Chat / RAG Service ─────────────────────────────────────────
+  chat-service:
+    build: ./services/chat-service
+    container_name: bnm-chat
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8002:8002"
+    environment:
+      DB_NAME:             ${DB_NAME:-postgres}
+      DB_USER:             ${DB_USER:-postgres}
+      DB_PASSWORD:         ${DB_PASSWORD:-bnm_password}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      OPENAI_API_KEY:      ${OPENAI_API_KEY}
+      OPENAI_MODEL:        ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_EMBED_MODEL:  ${OPENAI_EMBED_MODEL:-text-embedding-ada-002}
+      JWT_SECRET_KEY:      ${JWT_SECRET_KEY:-change_me_in_production}
+      BNM_DATA_DIR:        /app/data
+    volumes:
+      - bnm_conversations:/app/data/conversations
+      - bnm_documents:/app/data/documents
+
+  # ── Ticket Service ─────────────────────────────────────────────
+  ticket-service:
+    build: ./services/ticket-service
+    container_name: bnm-ticket
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8003:8003"
+    environment:
+      DB_NAME:        ${DB_NAME:-postgres}
+      DB_USER:        ${DB_USER:-postgres}
+      DB_PASSWORD:    ${DB_PASSWORD:-bnm_password}
+      DB_HOST:        postgres
+      DB_PORT:        5432
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL:   ${OPENAI_MODEL:-gpt-4o-mini}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change_me_in_production}
+      BNM_DATA_DIR:   /app/data
+    volumes:
+      - bnm_conversations:/app/data/conversations
+      - bnm_uploads:/app/data/uploads
+
+  # ── Document Service ───────────────────────────────────────────
+  document-service:
+    build: ./services/document-service
+    container_name: bnm-document
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8004:8004"
+    environment:
+      DB_NAME:        ${DB_NAME:-postgres}
+      DB_USER:        ${DB_USER:-postgres}
+      DB_PASSWORD:    ${DB_PASSWORD:-bnm_password}
+      DB_HOST:        postgres
+      DB_PORT:        5432
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change_me_in_production}
+      BNM_DATA_DIR:   /app/data
+    volumes:
+      - bnm_conversations:/app/data/conversations
+      - bnm_uploads:/app/data/uploads
+
+  # ── Admin Service ──────────────────────────────────────────────
+  admin-service:
+    build: ./services/admin-service
+    container_name: bnm-admin
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8005:8005"
+    environment:
+      DB_NAME:        ${DB_NAME:-postgres}
+      DB_USER:        ${DB_USER:-postgres}
+      DB_PASSWORD:    ${DB_PASSWORD:-bnm_password}
+      DB_HOST:        postgres
+      DB_PORT:        5432
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change_me_in_production}
+      BNM_DATA_DIR:   /app/data
+    volumes:
+      - bnm_conversations:/app/data/conversations
+
+  # ── Gateway ────────────────────────────────────────────────────
+  gateway:
+    build: ./services/gateway
+    container_name: bnm-gateway
+    restart: unless-stopped
+    depends_on:
+      - auth-service
+      - chat-service
+      - ticket-service
+      - document-service
+      - admin-service
+    ports:
+      - "8000:8000"
+    environment:
+      AUTH_SERVICE_URL:     http://auth-service:8001
+      CHAT_SERVICE_URL:     http://chat-service:8002
+      TICKET_SERVICE_URL:   http://ticket-service:8003
+      DOCUMENT_SERVICE_URL: http://document-service:8004
+      ADMIN_SERVICE_URL:    http://admin-service:8005
+
+  # ── Frontend React ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: bnm-frontend
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "5175:80"
+
+volumes:
+  bnm_postgres_data:
+  bnm_conversations:
+  bnm_documents:
+  bnm_uploads:

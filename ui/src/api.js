@@ -1,4 +1,5 @@
-const BASE = "http://localhost:8011";
+// Microservices gateway (port 8000) — monolithe de fallback sur 8011
+const BASE = "http://localhost:8000";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const getAuthHeaders = () => ({
