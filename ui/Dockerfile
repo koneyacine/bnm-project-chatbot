@@ -3,6 +3,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
+# Définir l'URL API du gateway
+ENV VITE_API_URL=http://localhost:8000
 RUN npm run build
 
 FROM nginx:alpine

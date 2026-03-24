@@ -5,8 +5,10 @@ RUN pip install --no-cache-dir psycopg2-binary bcrypt python-dotenv
 
 # Copier les migrations SQL et les scripts seed
 COPY migrations/ /app/migrations/
-COPY seed/seed_all.py /app/seed/seed_all.py
-COPY docker-entrypoint-setup.sh /app/docker-entrypoint-setup.sh
+COPY seed/ /app/seed/
+COPY auth.py /app/
+COPY conversation_store.py /app/
+COPY docker-entrypoint-setup.sh /app/
 RUN chmod +x /app/docker-entrypoint-setup.sh
 
 ENTRYPOINT ["/app/docker-entrypoint-setup.sh"]
