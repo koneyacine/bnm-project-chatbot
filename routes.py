@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from models import ClassifyRequest, ClassifyResponse, ChatRequest, ChatResponse
+from models import IntentRequest, IntentResponse, AnswerRequest, AnswerResponse
 from service import _CONV_PATTERNS
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
@@ -23,28 +23,32 @@ def rag_patterns():
     }
 
 
-@router.post("/classify", response_model=ClassifyResponse)
-def classify(req: ClassifyRequest):
+@router.post("/getIntent", response_model=IntentResponse)
+def get_intent(req: IntentRequest):
     """
-    Reçoit un message et retourne uniquement son intention (intent).
+    Reçoit une question et retourne uniquement son intention (intent).
     Valeurs possibles : VALIDATION | RECLAMATION | INFORMATION
     """
     from service import _classify_intent
 
-    result = _classify_intent(req.message)
+    result = _classify_intent(req.question)
     intent = result.get("intent", "INFORMATION")
 
     if intent not in ["VALIDATION", "RECLAMATION", "INFORMATION"]:
         intent = "INFORMATION"
 
-    return ClassifyResponse(intent=intent)
+    return IntentResponse(intent=intent)
 
 
-@router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+@router.post("/getAnswer", response_model=AnswerResponse)
+def get_answer(req: AnswerRequest):
     """
-    Reçoit un message + contexte et retourne la réponse RAG +
-    open_conversation + intent.
+    Reçoit une question + contexte et retourne la réponse RAG +
+    open_conversation + intent + context utilisé.
+    
+    Règle Spécifique :
+    - Si open_conversation = True : Prompt = Context (Derniers messages) + Base de Connaissance.
+    - Si open_conversation = False : Prompt = Base de Connaissance UNIQUEMENT.
     """
     import json
     import uuid
@@ -59,17 +63,19 @@ def chat(req: ChatRequest):
     from langchain_core.messages import HumanMessage, SystemMessage
 
     # ── Étape 1 : construire l'historique ────────────────────────────
+    # On prend les 5 derniers messages si présents
+    context_to_use = req.context[-5:] if len(req.context) > 5 else req.context
     lines = []
-    for msg in req.context:
+    for msg in context_to_use:
         role = "Client" if msg.role == "client" else "Conseiller BNM"
         lines.append(f"{role}: {msg.content}")
     historique = "\n".join(lines)
 
     # ── Étape 2 : classifier l'intent ────────────────────────────────
-    classification = _classify_intent(req.message)
+    classification = _classify_intent(req.question)
     intent = classification.get("intent", "INFORMATION")
 
-    # ── Étape 3 : open_conversation ──────────────────────────────────
+    # ── Étape 3 : détecter open_conversation ─────────────────────────
     if not req.context:
         open_conv = False
     else:
@@ -78,15 +84,10 @@ def chat(req: ChatRequest):
             "à une conversation bancaire en cours."
             " Réponds UNIQUEMENT en JSON : "
             '{"open_conversation": true | false} '
-            "Exemples : "
-            "message='mon dossier est validé ?' → true. "
-            "message='j ai envoyé ma photo' → true. "
-            "message='c est quoi le sms banking' → false. "
-            "message='bonjour' → false."
         )
         user_check = (
             f"Conversation en cours :\n{historique}\n\n"
-            f"Nouveau message : '{req.message}'\n"
+            f"Nouveau message : '{req.question}'\n"
             f"Ce message est-il lié à cette conversation ?"
         )
         try:
@@ -103,7 +104,7 @@ def chat(req: ChatRequest):
             open_conv = False
 
     # ── Étape 4 : recherche pgvector ─────────────────────────────────
-    q_vec = _get_embeddings().embed_query(req.message)
+    q_vec = _get_embeddings().embed_query(req.question)
     cur = _get_conn().cursor()
     cur.execute(
         "SELECT content, source FROM documents "
@@ -114,44 +115,27 @@ def chat(req: ChatRequest):
     cur.close()
     context_docs = "\n\n".join(c for c, _ in rows)
 
-    # ── Étape 5 : générer la réponse ─────────────────────────────────
+    # ── Étape 5 : construire le Prompt selon la règle demandée ───────
     SYSTEM_HUMAIN = (
-        "Tu es Yasmine, conseillère virtuelle "
-        "de la Banque Nationale de Mauritanie. "
-        "Tu parles avec bienveillance, clarté "
-        "et professionnalisme. "
-        "Tu vouvoies toujours le client. "
-        "Tu commences ta réponse par une "
-        "phrase d'accueil chaleureuse adaptée "
-        "au contexte. "
-        "Tu donnes des réponses précises basées "
-        "sur les documents BNM. "
-        "Tu termines toujours par une phrase "
-        "proposant de l'aide supplémentaire. "
-        "IMPORTANT : tu n'inventes jamais "
-        "d'informations. Si tu ne sais pas, "
-        "tu le dis poliment et tu proposes "
-        "de mettre en relation avec un conseiller."
+        "Tu es Yasmine, conseillère virtuelle de la BNM. "
+        "Tu donnes des réponses précises basées sur les documents BNM."
     )
 
     if open_conv:
+        # CAS 1 : Match avec le contexte → Context + Base de Connaissance
         rag_prompt = (
             f"Historique de la conversation :\n{historique}\n\n"
-            f"Documents BNM disponibles :\n{context_docs}\n\n"
-            f"Le client demande maintenant : {req.message}\n\n"
-            f"Réponds en tenant compte de l'historique et des documents."
+            f"Base de connaissance BNM :\n{context_docs}\n\n"
+            f"Question client : {req.question}"
         )
     else:
+        # CAS 2 : Changement de sujet → Base de Connaissance UNIQUEMENT
         rag_prompt = (
-            f"Voici le contexte de la conversation avec ce client :\n"
-            f"{historique}\n\n"
-            f"Documents BNM sur ce sujet :\n{context_docs}\n\n"
-            f"Nouvelle question du client : {req.message}\n\n"
-            f"Le client change de sujet. "
-            f"Réponds à sa nouvelle question en utilisant les documents BNM. "
-            f"Reste attentionné et professionnel."
+            f"Base de connaissance BNM :\n{context_docs}\n\n"
+            f"Nouvelle question client (nouveau sujet) : {req.question}"
         )
 
+    # ── Étape 6 : générer la réponse ─────────────────────────────────
     answer = _llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_HUMAIN),
         HumanMessage(content=rag_prompt),
@@ -159,20 +143,17 @@ def chat(req: ChatRequest):
 
     if _is_rag_weak(answer):
         answer = (
-            "Je comprends votre demande et je souhaite vous aider au mieux. "
-            "Malheureusement, je ne dispose pas de cette information en ce moment. "
-            "Je vous invite à contacter directement votre agence BNM ou "
-            "notre service client au numéro habituel. "
-            "Nous ferons tout notre possible pour vous accompagner."
+            "Je comprends votre demande. Malheureusement, je ne dispose pas "
+            "de cette information. Je vous invite à contacter notre service client."
         )
 
-    # ── Sauvegarder ──────────────────────────────────────────────────
+    # ── Étape 7 : sauvegarde et retour ───────────────────────────────
     session_id = f"chat_{uuid.uuid4().hex[:8]}"
-    save_message(session_id, "user", req.message)
+    save_message(session_id, "user", req.question)
     save_message(session_id, "assistant", answer, intent=intent)
 
-    return ChatResponse(
+    return AnswerResponse(
         answer=answer,
-        open_conversation=open_conv,
         intent=intent,
+        open_conversation=open_conv,
     )

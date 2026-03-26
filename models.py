@@ -18,11 +18,11 @@ class RAGResponse(BaseModel):
     session_id: str
 
 
-class ClassifyRequest(BaseModel):
-    message: str
+class IntentRequest(BaseModel):
+    question: str
 
 
-class ClassifyResponse(BaseModel):
+class IntentResponse(BaseModel):
     intent: str
 
 
@@ -32,13 +32,12 @@ class ContextMessage(BaseModel):
     content: str
 
 
-class ChatRequest(BaseModel):
-    message: str
+class AnswerRequest(BaseModel):
+    question: str
     context: List[ContextMessage] = []
 
 
-class ChatResponse(BaseModel):
+class AnswerResponse(BaseModel):
     answer:            str
-    open_conversation: bool
     intent:            str
-    # VALIDATION | RECLAMATION | INFORMATION
+    open_conversation: bool
