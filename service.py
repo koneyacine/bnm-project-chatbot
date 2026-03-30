@@ -305,7 +305,7 @@ def _classify_intent(question: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {
-            "intent":     "INFORMATION",
+            "intent":     "hi",
             "confidence": "LOW",
             "reason":     "classification échouée",
         }

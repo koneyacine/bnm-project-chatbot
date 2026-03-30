@@ -1,3 +1,4 @@
+
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -35,7 +36,7 @@ class ContextMessage(BaseModel):
 class AnswerRequest(BaseModel):
     question: str
     context: List[ContextMessage] = []
-
+    intent: str
 
 class AnswerResponse(BaseModel):
     answer:            str

@@ -10,7 +10,7 @@ def rag_health():
     return {
         "status":  "ok",
         "service": "bnm-rag-service",
-        "port":    8020,
+        "port":    8021,
     }
 
 
@@ -32,10 +32,10 @@ def get_intent(req: IntentRequest):
     from service import _classify_intent
 
     result = _classify_intent(req.question)
-    intent = result.get("intent", "INFORMATION")
+    intent = result.get("intent", "information")
 
     if intent not in ["VALIDATION", "RECLAMATION", "INFORMATION"]:
-        intent = "INFORMATION"
+        intent = "information"
 
     return IntentResponse(intent=intent)
 
@@ -147,13 +147,12 @@ def get_answer(req: AnswerRequest):
             "de cette information. Je vous invite à contacter notre service client."
         )
 
-    # ── Étape 7 : sauvegarde et retour ───────────────────────────────
-    session_id = f"chat_{uuid.uuid4().hex[:8]}"
-    save_message(session_id, "user", req.question)
-    save_message(session_id, "assistant", answer, intent=intent)
+
 
     return AnswerResponse(
         answer=answer,
         intent=intent,
         open_conversation=open_conv,
     )
+
+

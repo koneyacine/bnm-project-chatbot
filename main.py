@@ -12,6 +12,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes import router
+# Ingestion initiale des documents dans pgvector au démarrage du service
 
 app = FastAPI(
     title="BNM RAG Service",
