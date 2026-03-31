@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.bak.*
+.idea
+.vscode
+.DS_Store
+documents/
+ui/node_modules/
+node_modules/

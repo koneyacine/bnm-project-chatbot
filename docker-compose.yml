@@ -1,0 +1,35 @@
+services:
+
+  db:
+    image: ankane/pgvector:latest
+    container_name: bnm_db
+    restart: always
+    environment:
+      POSTGRES_DB: ${DB_NAME:-ma_base_vector}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-Yacine-96}
+    ports:
+      - "5433:5432"
+    volumes:
+      - bnm_pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: .
+    container_name: bnm_backend
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8021:8021"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+    volumes:
+      - .:/app
+    # documents folder might be needed for ingestion
+    # - ./documents:/app/documents
+
+volumes:
+  bnm_pgdata:
