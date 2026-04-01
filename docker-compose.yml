@@ -1,4 +1,3 @@
-
 services:
 
   db:
@@ -13,6 +12,8 @@ services:
       - "5433:5432"
     volumes:
       - bnm_pgdata:/var/lib/postgresql/data
+    networks:
+      - shared
 
   backend:
     build: .
@@ -29,8 +30,13 @@ services:
       - DB_PORT=5432
     volumes:
       - .:/app
-    # documents folder might be needed for ingestion
-    # - ./documents:/app/documents
+    networks:
+      - shared
 
 volumes:
   bnm_pgdata:
+
+networks:
+  shared:
+    external: true
+    name: shared-network
