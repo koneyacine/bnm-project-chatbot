@@ -64,11 +64,12 @@ def ingest(folder: str = "documents") -> None:
         chunks   = splitter.split_documents(raw_docs)
 
         for chunk in chunks:
-            vec = embeddings.embed_query(chunk.page_content)
+            clean_content = chunk.page_content.replace('\x00', '')
+            vec = embeddings.embed_query(clean_content)
             cur.execute(
                 "INSERT INTO documents (content, source, embedding) "
                 "VALUES (%s, %s, %s)",
-                (chunk.page_content, file, vec),
+                (clean_content, file, vec),
             )
         conn.commit()
         print(f" {len(chunks)} chunks")
