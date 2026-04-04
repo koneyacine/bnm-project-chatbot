@@ -80,8 +80,8 @@ def get_answer(req: AnswerRequest):
         open_conv = False
     else:
         system_check = (
-            "Tu analyses si un message est lié "
-            "à une conversation bancaire en cours."
+            "Tu analyses si un message est lié  a une autre message de cette conversation.  "
+            "à une message bancaire en cours."
             " Réponds UNIQUEMENT en JSON : "
             '{"open_conversation": true | false} '
         )
@@ -153,6 +153,150 @@ def get_answer(req: AnswerRequest):
         answer=answer,
         intent=intent,
         open_conversation=open_conv,
+
     )
 
 
+@router.post("/postAnswer")
+def post_answer(req: AnswerRequest):
+    """
+    Version corrigée :
+    - utilise intent et context depuis req
+    - corrige le bug réclamation existante
+    - retourne answer + intent + create_ticket + open_conversation
+    """
+
+    import json
+    from service import (
+        _llm_invoke_with_retry,
+        _get_embeddings,
+        _get_conn,
+        _is_rag_weak,
+    )
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    # ── Étape 1 : historique ────────────────────────────
+    context_to_use = req.context[-5:] if len(req.context) > 5 else req.context
+    lines = []
+    for msg in context_to_use:
+        role = "Client" if msg.role == "client" else "Conseiller BNM"
+        lines.append(f"{role}: {msg.content}")
+    historique = "\n".join(lines)
+
+    # ── Étape 2 : intent DIRECT depuis req ✅ ───────────
+    intent = req.intent if hasattr(req, "intent") else "INFORMATION"
+
+    # ── Étape 3 : open conversation ────────────────────
+    if not req.context:
+        open_conv = False
+    else:
+        system_check = (
+            "Tu analyses si un message est lié à une conversation en cours. "
+            'Réponds UNIQUEMENT en JSON : {"open_conversation": true | false}'
+        )
+        user_check = (
+            f"Conversation :\n{historique}\n\n"
+            f"Nouveau message : {req.question}"
+        )
+        try:
+            raw = _llm_invoke_with_retry([
+                SystemMessage(content=system_check),
+                HumanMessage(content=user_check),
+            ]).content.strip()
+
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            open_conv = json.loads(raw).get("open_conversation", False)
+        except Exception:
+            open_conv = False
+
+    # ── Étape 4 : RAG ───────────────────────────────────
+    q_vec = _get_embeddings().embed_query(req.question)
+    cur = _get_conn().cursor()
+    cur.execute(
+        "SELECT content FROM documents "
+        "ORDER BY embedding <-> %s::vector LIMIT 5;",
+        (q_vec,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    context_docs = "\n\n".join(c for (c,) in rows)
+
+    # ── Étape 5 : PROMPT corrigé 🔥 ─────────────────────
+    SYSTEM = (
+        "Tu es Yasmine, conseillère virtuelle de la BNM.\n"
+        "Tu dois répondre ET décider si un ticket doit être créé.\n\n"
+
+        "Réponds STRICTEMENT en JSON avec :\n"
+        "- answer\n"
+        "- create_ticket\n\n"
+
+        "Règles IMPORTANTES :\n"
+
+        "1. create_ticket = true UNIQUEMENT si le client veut créer une NOUVELLE réclamation.\n"
+
+        "2. create_ticket = false si :\n"
+        "- le client parle d’une réclamation déjà existante\n"
+        "- il demande un suivi (statut, progression, réponse...)\n"
+        "- il pose une question d'information\n\n"
+
+        "Exemples :\n"
+        "- 'je veux faire une réclamation' → true\n"
+        "- 'où en est ma réclamation ?' → false\n"
+        "- 'j'ai déjà fait une réclamation' → false\n"
+    )
+
+    if open_conv:
+        prompt = (
+            f"Intent: {intent}\n\n"
+            f"Historique:\n{historique}\n\n"
+            f"Base BNM:\n{context_docs}\n\n"
+            f"Question: {req.question}"
+        )
+    else:
+        prompt = (
+            f"Intent: {intent}\n\n"
+            f"Base BNM:\n{context_docs}\n\n"
+            f"Question: {req.question}"
+        )
+
+    # ── Étape 6 : appel LLM ─────────────────────────────
+    raw = _llm_invoke_with_retry([
+        SystemMessage(content=SYSTEM),
+        HumanMessage(content=prompt),
+    ]).content.strip()
+
+    # ── Étape 7 : parsing ───────────────────────────────
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+
+        result = json.loads(raw)
+
+        answer = result.get("answer", "")
+        create_ticket = bool(result.get("create_ticket", False))
+
+    except Exception:
+        answer = raw
+        create_ticket = False
+
+    # ── Étape 8 : fallback ──────────────────────────────
+    if _is_rag_weak(answer):
+        answer = (
+            "Je ne dispose pas de cette information. "
+            "Veuillez contacter le support BNM."
+        )
+
+    # ── Étape 9 : retour final ✅ ───────────────────────
+    return {
+        "answer": answer,
+        "intent": intent,
+        "create_ticket": create_ticket,
+        "open_conversation": open_conv
+    }
