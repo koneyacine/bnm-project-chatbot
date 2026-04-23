@@ -134,11 +134,26 @@ def get_session_history(session_id: str, limit: int = 6) -> list:
 # ── Classificateur ─────────────────────────────────────────────────────────────
 
 _CLASSIFIER_SYSTEM = (
-    "Tu es un classificateur bancaire. Analyse la demande client "
+    "Tu es un classificateur bancaire expert. Analyse la demande client "
     "et réponds UNIQUEMENT en JSON valide avec ce format exact :\n"
     '{"intent": "INFORMATION" | "RECLAMATION" | "VALIDATION", '
     '"confidence": "HIGH" | "MEDIUM" | "LOW", '
-    '"reason": "explication courte en français (max 10 mots)"}\n'
+    '"reason": "explication courte en français (max 10 mots)"}\n\n'
+    "RÈGLE ABSOLUE ET PRIORITAIRE :\n"
+    "Si le message du client contient uniquement des données brutes (numéros, chiffres, identifiants, "
+    "noms, codes, références) ET que le dernier message de l'assistant lui avait demandé ces données, "
+    "alors l'intent EST OBLIGATOIREMENT celui du sujet en cours dans l'historique. "
+    "Dans ce cas tu NE DOIS PAS classifier le message seul, tu DOIS hériter l'intent du contexte.\n\n"
+    "RÈGLES DE CLASSIFICATION :\n"
+    "- INFORMATION : demande de renseignement, question générale sur un produit/service\n"
+    "- RECLAMATION : problème, plainte, insatisfaction, erreur signalée\n"
+    "- VALIDATION : confirmation, accord, envoi de données pour valider un dossier/compte\n\n"
+    "EXEMPLES OBLIGATOIRES À RESPECTER :\n"
+    "- Assistant demande un numéro → client envoie '12345' → VALIDATION\n"
+    "- Assistant demande une pièce d'identité → client envoie son numéro → VALIDATION\n"
+    "- Assistant demande de décrire un problème → client répond → RECLAMATION\n"
+    "- Client envoie uniquement des chiffres après une demande de validation → VALIDATION\n"
+    "- Client pose une nouvelle question sans lien avec l'historique → INFORMATION\n\n"
     "Ne réponds rien d'autre que ce JSON."
 )
 
@@ -302,27 +317,32 @@ def _classify_intent(question: str, contexte: list = None) -> dict:
         # Construire le message avec contexte si disponible
         message_a_classifier = question
         if contexte and len(contexte) > 0:
-            # Formater l'historique de la conversation
             historique = "\n".join([
-                f"{msg['role']}: {msg['content']}" 
-                for msg in contexte[-5:]  # Garder les 5 derniers échanges
+                f"{msg['role']}: {msg['content']}"
+                for msg in contexte[-5:]
             ])
-            message_a_classifier = f"""Historique de la conversation :
+            message_a_classifier = f"""Tu dois classifier l'intention du NOUVEAU MESSAGE ci-dessous.
+
+Historique de la conversation (pour contexte uniquement) :
 {historique}
 
-Nouvelle question de l'utilisateur : {question}
+Nouveau message : {question}
 
-IMPORTANT : Utilise l'historique pour comprendre les références implicites (pronoms, sujets sous-entendus). Exemples :
-- Si l'utilisateur dit "oui" ou "je confirme" après une proposition, c'est une VALIDATION
-- Si l'utilisateur dit "non", "je ne suis pas d'accord" ou "problème", c'est une RECLAMATION
-- Si l'utilisateur demande une information générale, c'est INFORMATION
-- Les pronoms comme "celui-ci", "ça", "il" font référence au dernier sujet mentionné
+INSTRUCTIONS :
+1. Analyse d'abord le nouveau message SEUL. S'il est clair et autonome, classe-le directement.
+2. Si le nouveau message contient uniquement des données (numéros, chiffres, identifiants, informations personnelles),
+   remonte l'historique et hérite OBLIGATOIREMENT l'intention du dernier sujet en cours.
+3. Si l'assistant a demandé des informations dans son dernier message, la réponse du client hérite automatiquement de l'intention de ce sujet.
+4. Un message lié à une réclamation précédente reste RECLAMATION même si formulé positivement.
+5. Un message lié à une validation précédente reste VALIDATION même si c'est juste une réponse avec des données.
 
-RÈGLE DE PRIORITÉ :
-- La question actuelle détermine l'intention principale
-- Le contexte sert à interpréter les questions ambiguës ou les réponses courtes
-- En cas de doute entre INFORMATION et autre intention, privilégie INFORMATION"""
-
+EXEMPLES :
+- Assistant: "fournissez votre numéro de carte" → client: "ma carte est 4521" → VALIDATION
+- Assistant: "donnez-moi votre référence de commande" → client: "ref 789XY" → VALIDATION
+- Assistant: "quel est votre numéro de contrat ?" → client: "c'est le 00123" → VALIDATION
+- Assistant: "décrivez votre problème" → client: "le virement n'est pas passé" → RECLAMATION
+- Assistant: "pouvez-vous préciser votre réclamation ?" → client: "oui toujours le même souci" → RECLAMATION
+- Client pose une nouvelle question sans lien avec l'historique → INFORMATION"""
         msgs = [
             SystemMessage(content=_CLASSIFIER_SYSTEM),
             HumanMessage(content=message_a_classifier),
