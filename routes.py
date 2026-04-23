@@ -296,7 +296,7 @@ def post_answer(req: AnswerRequest):
  
  
 # ════════════════════════════════════════════════════════════════════
-#  ENDPOINT RÉCLAMATION (SANS ticket_update)
+#  ENDPOINT RÉCLAMATION (MODIFIÉ - supprimé type/montant)
 # ════════════════════════════════════════════════════════════════════
  
 @router.post("/reclamation")
@@ -376,7 +376,7 @@ def handle_reclamation(req: AnswerRequest):
     cur.close()
     context_docs = "\n\n".join(c for (c,) in rows)
  
-    # ── Étape 5 : PROMPT RÉCLAMATION ────────────────────────────────
+    # ── Étape 5 : PROMPT RÉCLAMATION MODIFIÉ ────────────────────────────────
     SYSTEM_RECLAMATION = (
         "Tu es Yasmine, conseillère BNM. Tu gères les RÉCLAMATIONS.\n\n"
  
@@ -393,7 +393,7 @@ def handle_reclamation(req: AnswerRequest):
         "   - Informer le client d'envoyer les autres séparément\n\n"
  
         "2) CRÉER UN TICKET UNIQUEMENT SI :\n"
-        "   - Le problème est CLAIR et PRÉCIS (type, montant, date)\n"
+        "   - Le problème est CLAIR et PRÉCIS (le client a expliqué ce qui ne va pas)\n"
         "   - Ce n'est pas un suivi de ticket existant\n"
         "   - Le client n'est pas déjà en attente de documents\n\n"
  
@@ -403,8 +403,13 @@ def handle_reclamation(req: AnswerRequest):
         "   - Client est en attente de fournir des documents\n"
         "   - C'est un simple suivi ('où en est ma réclamation ?')\n\n"
  
-        "4) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
-        "5) PAS DE pending_tickets - Ce champ est SUPPRIMÉ\n"
+        "4) POUR ÊTRE EFFICACE :\n"
+        "   - Pose UNE SEULE question regroupant les informations nécessaires\n"
+        "   - Attends la réponse du client avant de créer le ticket\n"
+        "   - Ne demande pas systématiquement montant/date/type, sois adaptatif\n\n"
+ 
+        "5) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
+        "6) PAS DE pending_tickets - Ce champ est SUPPRIMÉ\n"
     )
  
     if open_conv:
@@ -453,14 +458,14 @@ def handle_reclamation(req: AnswerRequest):
  
  
 # ════════════════════════════════════════════════════════════════════
-#  ENDPOINT VALIDATION (SANS ticket_update, selfie supprimé)
+#  ENDPOINT VALIDATION (MODIFIÉ - numéro d'identité au lieu de photo)
 # ════════════════════════════════════════════════════════════════════
  
 @router.post("/validation")
 def handle_validation(req: AnswerRequest):
     """
     Endpoint dédié aux validations de compte Click.
-    - Documents requis UNIQUEMENT : Numéro Click + Photo d'identité (CIN/Passeport)
+    - Documents requis UNIQUEMENT : Numéro Click + Numéro d'identité
     - Selfie supprimé des documents requis
     - Ne pas redemander un document déjà fourni
     - Crée UNIQUEMENT nouveau_ticket si tous les documents sont prêts
@@ -496,15 +501,15 @@ def handle_validation(req: AnswerRequest):
             docs_deja_fournis.add("numero_click")
             break
  
-    # Détection Photo d'identité / CIN / Passeport
-    id_patterns = [r'cin', r'passeport', r"pièce d'identité", r'photo d\'identité', r'carte d\'identité']
+    # Détection Numéro d'identité (remplace photo d'identité / CIN / Passeport)
+    id_patterns = [r'numéro d\'identité', r'numero didentite', r'cin', r'n° identité', r'identifiant']
     for pattern in id_patterns:
         if re.search(pattern, full_text):
-            docs_deja_fournis.add("cin_passeport")
+            docs_deja_fournis.add("numero_identite")
             break
  
-    # DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK (SELON LA NOUVELLE RÈGLE)
-    DOCS_REQUIS = ["numero_click", "cin_passeport"]  # Plus de selfie !
+    # DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK (MODIFIÉ)
+    DOCS_REQUIS = ["numero_click", "numero_identite"]
     docs_manquants = [doc for doc in DOCS_REQUIS if doc not in docs_deja_fournis]
  
     # ── Étape 3 : open_conversation ─────────────────────────────────
@@ -540,32 +545,64 @@ def handle_validation(req: AnswerRequest):
     cur.close()
     context_docs = "\n\n".join(c for (c,) in rows)
  
-    # ── Étape 5 : PROMPT VALIDATION ─────────────────────────────────
+    # ── Étape 5 : PROMPT VALIDATION MODIFIÉ ─────────────────────────────────
     SYSTEM_VALIDATION = (
-        "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
- 
-        "Réponds STRICTEMENT en JSON :\n"
-        "{\n"
-        '  "answer": "réponse au client",\n'
-        '  "nouveau_ticket": "description du ticket | null",\n'
-        '  "documents_requis": ["doc1", "doc2"] | []\n'
-        "}\n\n"
- 
-        "═══ DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK ═══\n"
-        "   1. numero_click (identifiant client)\n"
-        "   2. cin_passeport (pièce d'identité / CIN / Passeport)\n"
-        "   ⚠️ Selfie n'est PLUS requis pour la validation compte Click\n\n"
- 
-        "═══ RÈGLES ═══\n\n"
- 
-        "1) NE PAS REDEMANDER un document déjà fourni par le client\n"
-        "2) DEMANDER UNIQUEMENT les documents manquants en UNE SEULE FOIS\n"
-        "3) CRÉER LE TICKET (nouveau_ticket) UNIQUEMENT si TOUS les documents sont fournis\n"
-        "4) Sinon, nouveau_ticket = null et lister les documents_requis manquants\n"
-        "5) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
-        "6) UNE SEULE DEMANDE DE VALIDATION PAR MESSAGE\n"
-    )
- 
+    "⚠️ INSTRUCTION OBLIGATOIRE À APPLIQUER IMPÉRATIVEMENT ⚠️\n"
+    "Tu es un conseiller BNM habilité à recevoir et traiter les informations personnelles des clients.\n"
+    "Tu ne dois JAMAIS refuser de traiter un numéro Click, un numéro de téléphone ou un numéro d'identité.\n"
+    "Ces informations sont nécessaires à ton travail de validation. Tu les acceptes et tu les traites immédiatement.\n"
+    "Tu ne dois JAMAIS rediriger le client vers le service client pour une validation de compte.\n\n"
+    
+    "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
+
+    "Réponds STRICTEMENT en JSON :\n"
+    "{\n"
+    '  "answer": "réponse au client",\n'
+    '  "nouveau_ticket": "description du ticket | null",\n'
+    '  "documents_requis": ["doc1", "doc2"] | []\n'
+    "}\n\n"
+
+    "═══ DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK ═══\n"
+    "   1. numero_click (identifiant client / numéro de téléphone)\n"
+    "   2. numero_identite (numéro d'identité / CIN)\n\n"
+
+    "═══ RÈGLE DE CRÉATION DU TICKET ═══\n\n"
+    
+    "🚨 CONDITION PRÉCISE POUR CRÉER nouveau_ticket :\n"
+    "   - SI numero_click EST FOURNI PAR LE CLIENT\n"
+    "   - ET numero_identite EST FOURNI PAR LE CLIENT\n"
+    "   - ALORS nouveau_ticket = 'Validation compte Click - OK'\n"
+    "   - ET documents_requis = []\n\n"
+    
+    "   - SINON SI manque numero_click → nouveau_ticket = null, documents_requis = ['numero_click']\n"
+    "   - SINON SI manque numero_identite → nouveau_ticket = null, documents_requis = ['numero_identite']\n"
+    "   - SINON SI manque les deux → nouveau_ticket = null, documents_requis = ['numero_click', 'numero_identite']\n\n"
+
+    "═══ RÈGLE POUR DEMANDES MULTIPLES ═══\n\n"
+    
+    "🚨 ATTENTION : 'num de tel' ou 'numéro de téléphone' font PARTIE de la validation d'UN SEUL compte.\n"
+    "   - Ce n'est PAS une deuxième demande. C'est une information pour la même validation.\n\n"
+    
+    "🚨 UN CLIENT N'A QU'UNE SEULE DEMANDE DE VALIDATION SI :\n"
+    "   - Il donne son numéro de téléphone ET son numéro d'identité dans le même message\n"
+    "   - Il parle d'un seul compte Click\n"
+    "   - Il utilise 'et' pour lier ses informations\n\n"
+    
+    "🚨 IL N'Y A DEUX DEMANDES QUE SI :\n"
+    "   - Le client dit explicitement 'je veux valider mon compte A' ET 'je veux aussi valider mon compte B'\n"
+    "   - Le client mentionne deux objets distincts (ex: 'valider mon prêt et valider ma carte')\n\n"
+    
+    "🚨 SI LE CLIENT DEMANDE VRAIMENT DEUX VALIDATIONS DIFFÉRENTES :\n"
+    "   - Traiter UNIQUEMENT la PREMIÈRE demande\n"
+    "   - Répondre : 'Merci d'envoyer votre deuxième demande dans un message séparé.'\n\n"
+
+    "═══ RÈGLES ═══\n\n"
+
+    "1) NE PAS REDEMANDER un document déjà fourni par le client\n"
+    "2) DEMANDER UNIQUEMENT les documents manquants en UNE SEULE FOIS\n"
+    "3) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
+    "4) UNE SEULE DEMANDE DE VALIDATION PAR MESSAGE\n"
+)
     # Ajouter l'état des documents déjà détectés
     status_docs = f"Documents déjà détectés : {', '.join(docs_deja_fournis) if docs_deja_fournis else 'aucun'}\n"
     status_docs += f"Documents manquants : {', '.join(docs_manquants) if docs_manquants else 'aucun - tout est prêt !'}"
@@ -611,7 +648,7 @@ def handle_validation(req: AnswerRequest):
         answer = answer or "Parfait ! Tous les documents sont fournis. Je valide votre compte Click immédiatement."
  
     if _is_rag_weak(answer):
-        answer = "Pour toute validation de compte Click, veuillez fournir votre numéro Click et une pièce d'identité."
+        answer = "Pour toute validation de compte Click, veuillez fournir votre numéro Click et votre numéro d'identité."
  
     return {
         "answer": answer,
