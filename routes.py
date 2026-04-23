@@ -31,7 +31,7 @@ def get_intent(req: IntentRequest):
     """
     from service import _classify_intent
  
-    result = _classify_intent(req.question)
+    result = _classify_intent(req.question, req.contexte)  # contexte directement depuis req
     intent = result.get("intent", "INFORMATION").upper()
  
     if intent not in ["VALIDATION", "RECLAMATION", "INFORMATION"]:
@@ -410,6 +410,12 @@ def handle_reclamation(req: AnswerRequest):
  
         "5) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
         "6) PAS DE pending_tickets - Ce champ est SUPPRIMÉ\n"
+        "7) QUAND TU CRÉES LE TICKET :\n"
+        "   - Il est FORMELLEMENT INTERDIT de dire 'j'ai créé un ticket' ou toute phrase contenant le mot 'ticket'\n"
+        "   - Il est FORMELLEMENT INTERDIT de dire 'consultez un conseiller' ou 'contactez le service client' ou toute phrase invitant le client à consulter un agent\n"
+        "   - La description dans nouveau_ticket doit être claire et précise, résumant le problème\n"
+        "   - Exemple de bonne description : 'Problème d'affichage du solde Click - client ne voit pas son solde'\n"
+        "   - Exemple de mauvaise description : 'réclamation client' (trop vague)\n"
     )
  
     if open_conv:

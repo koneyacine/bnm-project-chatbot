@@ -290,12 +290,42 @@ def _llm_invoke_with_retry(prompt, max_retries: int = 1):
                 raise
 
 
-def _classify_intent(question: str) -> dict:
-    """Classifie l'intention via OpenAI. Fallback sur INFORMATION si erreur."""
+def _classify_intent(question: str, contexte: list = None) -> dict:
+    """Classifie l'intention via OpenAI avec prise en compte du contexte conversationnel.
+    
+    Args:
+        question: La question de l'utilisateur
+        contexte: Liste des messages précédents au format 
+                  [{"role": "client"|"assistant", "content": str}]
+    """
     try:
+        # Construire le message avec contexte si disponible
+        message_a_classifier = question
+        if contexte and len(contexte) > 0:
+            # Formater l'historique de la conversation
+            historique = "\n".join([
+                f"{msg['role']}: {msg['content']}" 
+                for msg in contexte[-5:]  # Garder les 5 derniers échanges
+            ])
+            message_a_classifier = f"""Historique de la conversation :
+{historique}
+
+Nouvelle question de l'utilisateur : {question}
+
+IMPORTANT : Utilise l'historique pour comprendre les références implicites (pronoms, sujets sous-entendus). Exemples :
+- Si l'utilisateur dit "oui" ou "je confirme" après une proposition, c'est une VALIDATION
+- Si l'utilisateur dit "non", "je ne suis pas d'accord" ou "problème", c'est une RECLAMATION
+- Si l'utilisateur demande une information générale, c'est INFORMATION
+- Les pronoms comme "celui-ci", "ça", "il" font référence au dernier sujet mentionné
+
+RÈGLE DE PRIORITÉ :
+- La question actuelle détermine l'intention principale
+- Le contexte sert à interpréter les questions ambiguës ou les réponses courtes
+- En cas de doute entre INFORMATION et autre intention, privilégie INFORMATION"""
+
         msgs = [
             SystemMessage(content=_CLASSIFIER_SYSTEM),
-            HumanMessage(content=question),
+            HumanMessage(content=message_a_classifier),
         ]
         raw = _llm_invoke_with_retry(msgs).content.strip()
         if raw.startswith("```"):
@@ -305,10 +335,12 @@ def _classify_intent(question: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {
-            "intent":     "hi",
+            "intent":     "INFORMATION",
             "confidence": "LOW",
-            "reason":     "classification échouée",
-        }
+            "reason":     "classification échouée"
+            }
+
+ 
 
 
 # ── Pipeline principal ─────────────────────────────────────────────────────────

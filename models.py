@@ -40,7 +40,7 @@ class AnswerRequest(BaseModel):
 # ── Autres modèles ───────────────────────────────────────────────────
 class IntentRequest(BaseModel):
     question: str
- 
+    contexte: Optional[List[dict]] = None  # Contexte extrait depuis la requête
  
 class IntentResponse(BaseModel):
     intent: str
