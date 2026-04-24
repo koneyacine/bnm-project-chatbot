@@ -321,28 +321,35 @@ def _classify_intent(question: str, contexte: list = None) -> dict:
                 f"{msg['role']}: {msg['content']}"
                 for msg in contexte[-5:]
             ])
-            message_a_classifier = f"""Tu dois classifier l'intention du NOUVEAU MESSAGE ci-dessous.
-
-Historique de la conversation (pour contexte uniquement) :
+            message_a_classifier = f"""Historique de la conversation :
 {historique}
 
-Nouveau message : {question}
+Nouveau message du client : {question}
 
-INSTRUCTIONS :
-1. Analyse d'abord le nouveau message SEUL. S'il est clair et autonome, classe-le directement.
-2. Si le nouveau message contient uniquement des données (numéros, chiffres, identifiants, informations personnelles),
-   remonte l'historique et hérite OBLIGATOIREMENT l'intention du dernier sujet en cours.
-3. Si l'assistant a demandé des informations dans son dernier message, la réponse du client hérite automatiquement de l'intention de ce sujet.
-4. Un message lié à une réclamation précédente reste RECLAMATION même si formulé positivement.
-5. Un message lié à une validation précédente reste VALIDATION même si c'est juste une réponse avec des données.
+ANALYSE OBLIGATOIRE EN 2 ÉTAPES :
+
+ÉTAPE 1 — Lis le dernier message de l'assistant dans l'historique.
+ÉTAPE 2 — Le nouveau message du client est-il lié à ce sujet en cours ?
+
+RÈGLE : Un message est lié au sujet en cours si :
+- Il parle du MÊME objet (compte, virement, dossier, validation, réclamation...)
+- Il demande un suivi, une mise à jour, ou un statut de ce qui a été discuté
+- Il exprime une réaction à la dernière réponse de l'assistant
+- Il est une confirmation, négation, ou question sur le même sujet
+
+SI LIÉ AU SUJET EN COURS → hérite OBLIGATOIREMENT l'intent du sujet :
+- sujet = validation/compte/numéro/documents → VALIDATION
+- sujet = problème/réclamation/erreur/virement → RECLAMATION
+
+SI NOUVEAU SUJET SANS LIEN → INFORMATION
 
 EXEMPLES :
-- Assistant: "fournissez votre numéro de carte" → client: "ma carte est 4521" → VALIDATION
-- Assistant: "donnez-moi votre référence de commande" → client: "ref 789XY" → VALIDATION
-- Assistant: "quel est votre numéro de contrat ?" → client: "c'est le 00123" → VALIDATION
-- Assistant: "décrivez votre problème" → client: "le virement n'est pas passé" → RECLAMATION
-- Assistant: "pouvez-vous préciser votre réclamation ?" → client: "oui toujours le même souci" → RECLAMATION
-- Client pose une nouvelle question sans lien avec l'historique → INFORMATION"""
+- Sujet en cours = validation → client: "où en est ma validation ?" → VALIDATION
+- Sujet en cours = validation → client: "c'est bon ?" → VALIDATION
+- Sujet en cours = réclamation → client: "toujours pas résolu ?" → RECLAMATION
+- Sujet en cours = réclamation → client: "non ça marche pas encore" → RECLAMATION
+- Sujet en cours = validation → client: "quest ce qu'il se passe ?" → VALIDATION
+- Client change de sujet → "c'est quoi les frais BNM ?" → INFORMATION"""
         msgs = [
             SystemMessage(content=_CLASSIFIER_SYSTEM),
             HumanMessage(content=message_a_classifier),
