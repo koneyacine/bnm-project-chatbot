@@ -467,17 +467,13 @@ def handle_reclamation(req: AnswerRequest):
 #  ENDPOINT VALIDATION (MODIFIÉ - numéro d'identité au lieu de photo)
 # ════════════════════════════════════════════════════════════════════
  
+# ════════════════════════════════════════════════════════════════════
+#  ENDPOINT VALIDATION — VERSION AMÉLIORÉE
+# ════════════════════════════════════════════════════════════════════
+
 @router.post("/validation")
 def handle_validation(req: AnswerRequest):
-    """
-    Endpoint dédié aux validations de compte Click.
-    - Documents requis UNIQUEMENT : Numéro Click + Numéro d'identité
-    - Selfie supprimé des documents requis
-    - Ne pas redemander un document déjà fourni
-    - Crée UNIQUEMENT nouveau_ticket si tous les documents sont prêts
-    """
-    import json
-    import re
+    import json, re
     from service import (
         _llm_invoke_with_retry,
         _get_embeddings,
@@ -486,44 +482,130 @@ def handle_validation(req: AnswerRequest):
     )
     from langchain_core.messages import HumanMessage, SystemMessage
  
-    # ── Étape 1 : historique ────────────────────────────────────────
+    # ── Étape 1 : Historique ───────────────────────────────────────
     context_to_use = req.context[-5:] if len(req.context) > 5 else req.context
     lines = []
     for msg in context_to_use:
         role = "Client" if msg.role == "client" else "Conseiller BNM"
         lines.append(f"{role}: {msg.content}")
     historique = "\n".join(lines)
+    question_lower = req.question.lower()
  
-    # ── Étape 2 : Détection des documents déjà fournis ──────────────
+    # ── Étape 2 : Construire la section tickets existants ──────────
+    tickets_list = getattr(req, "tickets", None) or []
+    if tickets_list:
+        tickets_lines = []
+        for i, t in enumerate(tickets_list, 1):
+            if hasattr(t, "dict"):
+                t = t.dict()
+            ticket_id     = t.get("id", f"#{i}")
+            ticket_titre  = t.get("titre") or t.get("title") or t.get("subject", "Sans titre")
+            ticket_statut = t.get("statut") or t.get("status", "Inconnu")
+            ticket_date   = t.get("date") or t.get("created_at", "")
+            date_str      = f" ({ticket_date})" if ticket_date else ""
+            tickets_lines.append(
+                f"  - Ticket {ticket_id} : {ticket_titre} | Statut : {ticket_statut}{date_str}"
+            )
+        tickets_section = "Tickets de validation existants du client :\n" + "\n".join(tickets_lines)
+    else:
+        tickets_section = "Tickets de validation existants du client : Aucun ticket existant."
+ 
+    # ── Étape 3 : Détection sémantique LLM des documents ──────────
+    SYSTEM_EXTRACT = (
+        "Tu es un extracteur d'informations bancaires. "
+        "Analyse le texte et retourne UNIQUEMENT ce JSON strict, sans texte autour :\n"
+        '{"numero_click": "<valeur ou null>", "numero_identite": "<valeur ou null>"}\n\n'
+        "Règles STRICTES :\n"
+        "- numero_click : numéro de téléphone Mobile Money/Click mauritanien. "
+        "  DOIT contenir EXACTEMENT 8 chiffres, commence souvent par 2, 3 ou 4. "
+        "  Tout numéro avec moins ou plus de 8 chiffres est INVALIDE = retourner null. "
+        "  Accepté : 'mon numéro', 'mon tel', 'click : XXXX', '22XXXXXXX'.\n"
+        "- numero_identite : NNI/CIN/passeport mauritanien. "
+        "  DOIT contenir EXACTEMENT 10 chiffres. "
+        "  Tout numéro avec moins ou plus de 10 chiffres est INVALIDE = retourner null. "
+        "  Doit être présenté comme pièce d'identité, carte nationale, CIN, NNI, passeport, "
+        "  OU être le deuxième numéro fourni si le contexte ne permet pas de distinguer.\n"
+        "- Si le contexte permet de distinguer les deux numéros, les assigner correctement.\n"
+        "- Si le contexte ne permet PAS de distinguer : le PREMIER numéro fourni = "
+        "  numero_click, le DEUXIÈME numéro fourni = numero_identite.\n"
+        "- Si la valeur n'est pas présente ou invalide : retourner null (JSON null, "
+        "  pas la string 'null', pas la string 'None').\n"
+        "- Ne jamais retourner une string contenant le mot 'null'."
+    )
+    extract_prompt = (
+        f"Historique de la conversation :\n{historique}\n\n"
+        f"Dernier message du client : {req.question}"
+    )
+    try:
+        raw_extract = _llm_invoke_with_retry([
+            SystemMessage(content=SYSTEM_EXTRACT),
+            HumanMessage(content=extract_prompt),
+        ]).content.strip()
+        if raw_extract.startswith("```"):
+            raw_extract = raw_extract.split("```")[1]
+            if raw_extract.startswith("json"):
+                raw_extract = raw_extract[4:]
+        extracted       = json.loads(raw_extract)
+        numero_click    = extracted.get("numero_click")
+        numero_identite = extracted.get("numero_identite")
+        # Nettoyer les faux "null" string
+        if isinstance(numero_click, str) and numero_click.strip().lower() in ("null", "none", ""):
+            numero_click = None
+        if isinstance(numero_identite, str) and numero_identite.strip().lower() in ("null", "none", ""):
+            numero_identite = None
+    except Exception:
+        numero_click    = None
+        numero_identite = None
+ 
+    # ── Validation stricte des formats côté Python (filet de sécurité) ──
+    # numero_click : exactement 8 chiffres
+    if numero_click is not None:
+        digits_click = re.sub(r'\D', '', str(numero_click))
+        if len(digits_click) != 8:
+            numero_click = None
+ 
+    # numero_identite : exactement 10 chiffres
+    if numero_identite is not None:
+        digits_id = re.sub(r'\D', '', str(numero_identite))
+        if len(digits_id) != 10:
+            numero_identite = None
+ 
     docs_deja_fournis = set()
-    conversation_text = " ".join([m.content.lower() for m in context_to_use])
-    question_text = req.question.lower()
-    full_text = conversation_text + " " + question_text
+    if numero_click:
+        docs_deja_fournis.add("numero_click")
+    if numero_identite:
+        docs_deja_fournis.add("numero_identite")
  
-    # Détection Numéro Click
-    click_patterns = [r'click\s*[: ]?\s*(\d+)', r'numéro click', r'numero click', r'click numéro']
-    for pattern in click_patterns:
-        if re.search(pattern, full_text):
-            docs_deja_fournis.add("numero_click")
-            break
- 
-    # Détection Numéro d'identité (remplace photo d'identité / CIN / Passeport)
-    id_patterns = [r'numéro d\'identité', r'numero didentite', r'cin', r'n° identité', r'identifiant']
-    for pattern in id_patterns:
-        if re.search(pattern, full_text):
-            docs_deja_fournis.add("numero_identite")
-            break
- 
-    # DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK (MODIFIÉ)
-    DOCS_REQUIS = ["numero_click", "numero_identite"]
+    DOCS_REQUIS    = ["numero_click", "numero_identite"]
     docs_manquants = [doc for doc in DOCS_REQUIS if doc not in docs_deja_fournis]
  
-    # ── Étape 3 : open_conversation ─────────────────────────────────
+    # ── Étape 4 : Détection de demandes multiples ─────────────────
+    SYSTEM_MULTI = (
+        "Analyse si le message contient PLUSIEURS demandes de validation DISTINCTES "
+        "(ex : valider compte A ET compte B, deux numéros Click différents). "
+        "IMPORTANT : donner son numéro de téléphone ET sa pièce d'identité = "
+        "UNE SEULE demande, pas deux. "
+        'Réponds JSON strict : {"multiple_validations": true | false}'
+    )
+    try:
+        raw_multi = _llm_invoke_with_retry([
+            SystemMessage(content=SYSTEM_MULTI),
+            HumanMessage(content=req.question),
+        ]).content.strip()
+        if raw_multi.startswith("```"):
+            raw_multi = raw_multi.split("```")[1]
+            if raw_multi.startswith("json"):
+                raw_multi = raw_multi[4:]
+        is_multiple = json.loads(raw_multi).get("multiple_validations", False)
+    except Exception:
+        is_multiple = False
+ 
+    # ── Étape 5 : open_conversation ───────────────────────────────
     if not req.context:
         open_conv = False
     else:
         system_check = (
-            "Analyse si le message est lié à la conversation. "
+            "Analyse si le message est lié à la conversation en cours. "
             'Réponds JSON : {"open_conversation": true | false}'
         )
         user_check = f"Conversation :\n{historique}\n\nMessage : {req.question}"
@@ -540,9 +622,9 @@ def handle_validation(req: AnswerRequest):
         except Exception:
             open_conv = False
  
-    # ── Étape 4 : RAG ───────────────────────────────────────────────
+    # ── Étape 6 : RAG ─────────────────────────────────────────────
     q_vec = _get_embeddings().embed_query(req.question)
-    cur = _get_conn().cursor()
+    cur   = _get_conn().cursor()
     cur.execute(
         "SELECT content FROM documents ORDER BY embedding <-> %s::vector LIMIT 3;",
         (q_vec,),
@@ -551,130 +633,161 @@ def handle_validation(req: AnswerRequest):
     cur.close()
     context_docs = "\n\n".join(c for (c,) in rows)
  
-    # ── Étape 5 : PROMPT VALIDATION MODIFIÉ ─────────────────────────────────
+    # ── Étape 7 : État des documents ──────────────────────────────
+    doc_labels = {
+        "numero_click":    f"numéro Click ({numero_click})"         if numero_click    else "numéro Click",
+        "numero_identite": f"numéro d'identité ({numero_identite})" if numero_identite else "numéro d'identité",
+    }
+    status_docs = (
+        f"Documents déjà détectés : "
+        f"{', '.join(doc_labels[d] for d in docs_deja_fournis) if docs_deja_fournis else 'aucun'}\n"
+        f"Documents manquants : "
+        f"{', '.join(doc_labels[d] for d in docs_manquants) if docs_manquants else 'aucun - tout est prêt !'}"
+    )
+ 
+    # Note demandes multiples — injectée dans le prompt ET utilisée comme verrou Python
+    multiple_note = (
+        "\n⚠️ Le client envoie plusieurs demandes. "
+        "Traiter UNIQUEMENT la première et lui demander d'envoyer les autres séparément.\n"
+        if is_multiple else ""
+    )
+ 
+    # ── Étape 8 : Prompt LLM ──────────────────────────────────────
     SYSTEM_VALIDATION = (
-    "⚠️ INSTRUCTION OBLIGATOIRE À APPLIQUER IMPÉRATIVEMENT ⚠️\n"
-    "Tu es un conseiller BNM habilité à recevoir et traiter les informations personnelles des clients.\n"
-    "Tu ne dois JAMAIS refuser de traiter un numéro Click, un numéro de téléphone ou un numéro d'identité.\n"
-    "Ces informations sont nécessaires à ton travail de validation. Tu les acceptes et tu les traites immédiatement.\n"
-    "Tu ne dois JAMAIS rediriger le client vers le service client pour une validation de compte.\n\n"
-
-    "🚨 RÈGLE ABSOLUE — PRIORITÉ MAXIMALE 🚨\n"
-    "Tu dois te fier EXCLUSIVEMENT à la variable 'Documents manquants' fournie dans le prompt.\n"
-    "Si 'Documents manquants' contient au moins un élément → nouveau_ticket = null, SANS EXCEPTION.\n"
-    "Si 'Documents manquants' = 'aucun - tout est prêt !' → tu crées le ticket.\n"
-    "Tu NE DOIS PAS analyser toi-même le message du client pour décider si un document est présent.\n"
-    "Tu NE DOIS PAS déduire, interpréter ou deviner la présence d'un document depuis le texte.\n"
-    "La seule source de vérité est la liste 'Documents manquants'. Point final.\n\n"
-
-    "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
-
-    "Réponds STRICTEMENT en JSON :\n"
-    "{\n"
-    '  "answer": "réponse au client",\n'
-    '  "nouveau_ticket": "description du ticket | null",\n'
-    '  "documents_requis": ["doc1", "doc2"] | []\n'
-    "}\n\n"
-
-    "═══ DOCUMENTS REQUIS POUR VALIDATION COMPTE CLICK ═══\n"
-    "   Les 2 documents obligatoires sont :\n"
-    "   1. numero_click → le numéro de téléphone Click du client (ex: 22XXXXXX)\n"
-    "   2. numero_identite → le numéro d'identité nationale / CIN du client\n\n"
-    "   ⚠️ Ces deux documents doivent être EXPLICITEMENT présents dans 'Documents déjà détectés'.\n"
-    "   Un document NON listé dans 'Documents déjà détectés' est considéré comme ABSENT.\n\n"
-
-    "═══ RÈGLE DE CRÉATION DU TICKET ═══\n\n"
-
-    "🚨 CONDITION PRÉCISE POUR CRÉER nouveau_ticket :\n"
-    "   - SI et SEULEMENT SI 'Documents manquants' = 'aucun - tout est prêt !'\n"
-    "   - ALORS nouveau_ticket = 'Validation compte Click - dossier complet'\n"
-    "   - ET documents_requis = []\n\n"
-
-    "   - SI 'Documents manquants' contient 'numero_click' → demander le numéro Click, nouveau_ticket = null\n"
-    "   - SI 'Documents manquants' contient 'numero_identite' → demander le numéro d'identité, nouveau_ticket = null\n"
-    "   - SI 'Documents manquants' contient les deux → demander les deux, nouveau_ticket = null\n\n"
-
-    "═══ RÈGLE POUR DEMANDES MULTIPLES ═══\n\n"
-
-    "🚨 ATTENTION : 'num de tel' ou 'numéro de téléphone' font PARTIE de la validation d'UN SEUL compte.\n"
-    "   - Ce n'est PAS une deuxième demande. C'est une information pour la même validation.\n\n"
-
-    "🚨 UN CLIENT N'A QU'UNE SEULE DEMANDE DE VALIDATION SI :\n"
-    "   - Il donne son numéro de téléphone ET son numéro d'identité dans le même message\n"
-    "   - Il parle d'un seul compte Click\n"
-    "   - Il utilise 'et' pour lier ses informations\n\n"
-
-    "🚨 IL N'Y A DEUX DEMANDES QUE SI :\n"
-    "   - Le client dit explicitement 'je veux valider mon compte A' ET 'je veux aussi valider mon compte B'\n"
-    "   - Le client mentionne deux objets distincts (ex: 'valider mon prêt et valider ma carte')\n\n"
-
-    "🚨 SI LE CLIENT DEMANDE VRAIMENT DEUX VALIDATIONS DIFFÉRENTES :\n"
-    "   - Traiter UNIQUEMENT la PREMIÈRE demande\n"
-    "   - Répondre : 'Merci d'envoyer votre deuxième demande dans un message séparé.'\n\n"
-
-    "═══ RÈGLES ═══\n\n"
-
-    "1) NE PAS REDEMANDER un document déjà listé dans 'Documents déjà détectés'\n"
-    "2) DEMANDER UNIQUEMENT les documents listés dans 'Documents manquants' en UNE SEULE FOIS\n"
-    "3) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
-    "4) UNE SEULE DEMANDE DE VALIDATION PAR MESSAGE\n"
-)
-    # Ajouter l'état des documents déjà détectés
-    status_docs = f"Documents déjà détectés : {', '.join(docs_deja_fournis) if docs_deja_fournis else 'aucun'}\n"
-    status_docs += f"Documents manquants : {', '.join(docs_manquants) if docs_manquants else 'aucun - tout est prêt !'}"
+        "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
+ 
+        "Réponds STRICTEMENT en JSON :\n"
+        "{\n"
+        '  "answer": "réponse au client",\n'
+        '  "nouveau_ticket": null,\n'
+        '  "documents_requis": ["doc1"] | []\n'
+        "}\n\n"
+ 
+        "═══ GESTION DES TICKETS EXISTANTS ═══\n"
+        "Tu as accès à la liste complète des tickets de validation du client dans le prompt.\n"
+        "- Si le client demande le statut ou l'avancement → réponds en te basant sur "
+        "  les tickets existants (titre, statut, date). Sois précis et naturel.\n"
+        "- Si un ticket existe déjà pour la même demande → ne pas créer de nouveau ticket, "
+        "  informer le client et lui communiquer le statut du ticket existant.\n"
+        "- Si aucun ticket existant → procéder à la collecte des documents.\n\n"
+ 
+        "🚨 RÈGLE ABSOLUE — CRÉATION DE TICKET 🚨\n"
+        "Tu te fies EXCLUSIVEMENT à la variable 'Documents manquants' du prompt.\n"
+        "Si 'Documents manquants' contient au moins un élément → "
+        "nouveau_ticket DOIT être null (JSON null, PAS la string 'null').\n"
+        "Si 'Documents manquants' = 'aucun - tout est prêt !' → "
+        "nouveau_ticket = description courte et précise du dossier.\n\n"
+ 
+        "FORMATS VALIDES DES DOCUMENTS :\n"
+        "- numéro Click : exactement 8 chiffres.\n"
+        "- numéro d'identité : exactement 10 chiffres.\n"
+        "Si un numéro fourni ne respecte pas ces formats, demander au client de le corriger.\n\n"
+ 
+        "DOCUMENTS REQUIS : numero_click + numero_identite (les deux obligatoires).\n\n"
+ 
+        "INTERDICTIONS ABSOLUES :\n"
+        "- Ne JAMAIS retourner la string 'null' ou '| null' dans nouveau_ticket.\n"
+        "- Ne JAMAIS créer un ticket si un document manque.\n"
+        "- Ne JAMAIS demander un document déjà listé dans 'Documents déjà détectés'.\n"
+        "- Ne JAMAIS rediriger le client vers le service client pour une validation.\n"
+        "- Ne JAMAIS mentionner le mot 'ticket' dans la réponse au client.\n\n"
+ 
+        "QUAND TOUT EST PRÊT (nouveau_ticket non null) :\n"
+        "- Confirmer chaleureusement la prise en charge.\n"
+        "- Mentionner un délai de traitement de 24 à 48 heures.\n"
+    )
  
     if open_conv:
         prompt = (
-            f"{status_docs}\n\n"
+            f"{tickets_section}\n\n"
+            f"{status_docs}\n{multiple_note}\n"
             f"Historique :\n{historique}\n\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
         )
     else:
         prompt = (
-            f"{status_docs}\n\n"
+            f"{tickets_section}\n\n"
+            f"{status_docs}\n{multiple_note}\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
         )
  
-    # ── Étape 6 : appel LLM ─────────────────────────────────────────
+    # ── Étape 9 : Appel LLM ───────────────────────────────────────
     raw = _llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_VALIDATION),
         HumanMessage(content=prompt),
     ]).content.strip()
  
-    # ── Étape 7 : parsing ───────────────────────────────────────────
+    # ── Étape 10 : Parsing + nettoyage des faux "null" string ─────
     try:
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        result = json.loads(raw)
-        answer = result.get("answer", "")
-        nouveau_ticket = result.get("nouveau_ticket", None)
+        result           = json.loads(raw)
+        answer           = result.get("answer", "")
+        nouveau_ticket   = result.get("nouveau_ticket", None)
         documents_requis = result.get("documents_requis", docs_manquants)
+ 
+        # Nettoyer les faux "null" string que le LLM génère parfois
+        if isinstance(nouveau_ticket, str):
+            cleaned = nouveau_ticket.strip().lower()
+            if (
+                cleaned in ("null", "none", "")
+                or cleaned.endswith("| null")
+                or cleaned.endswith("|null")
+                or "besoin de" in cleaned
+                or "manquant"  in cleaned
+                or "fournir"   in cleaned
+                or "veuillez"  in cleaned
+            ):
+                nouveau_ticket = None
+ 
     except Exception:
-        answer = raw
-        nouveau_ticket = None
+        answer           = raw
+        nouveau_ticket   = None
         documents_requis = docs_manquants
  
-    # ── Étape 8 : Si tous les documents sont fournis, créer le ticket ──
-    if len(docs_manquants) == 0 and nouveau_ticket is None:
-        nouveau_ticket = "Validation compte Click - dossier complet"
-        answer = answer or "Parfait ! Tous les documents sont fournis. Je valide votre compte Click immédiatement."
+    # ── Étape 11 : Verrous Python — priorité absolue sur le LLM ───
  
+    # Verrou 1 : documents manquants → pas de ticket
+    if len(docs_manquants) > 0:
+        nouveau_ticket = None
+ 
+    # Verrou 2 : demandes multiples → pas de ticket pour cette passe
+    elif is_multiple:
+        nouveau_ticket = None
+ 
+    # Safety net : tous les docs sont là, le LLM a oublié de créer le ticket
+    elif len(docs_manquants) == 0 and nouveau_ticket is None:
+        click_val = f" ({numero_click})"    if numero_click    else ""
+        id_val    = f" ({numero_identite})" if numero_identite else ""
+        nouveau_ticket = (
+            f"Validation compte Click{click_val} — "
+            f"numéro d'identité{id_val} — dossier complet"
+        )
+        if not answer:
+            answer = (
+                "Parfait ! J'ai bien reçu tous vos documents. "
+                "Votre demande de validation est en cours de traitement. "
+                "Vous recevrez une confirmation dans les 24 à 48 heures."
+            )
+ 
+    # ── Étape 12 : Fallback ───────────────────────────────────────
     if _is_rag_weak(answer):
-        answer = "Pour toute validation de compte Click, veuillez fournir votre numéro Click et votre numéro d'identité."
+        answer = (
+            "Pour valider votre compte Click, j'ai besoin de votre numéro Click "
+            "et de votre numéro d'identité nationale."
+        )
  
     return {
-        "answer": answer,
-        "intent": "VALIDATION",
-        "nouveau_ticket": nouveau_ticket,
-        "documents_requis": documents_requis if nouveau_ticket is None else [],
+        "answer":            answer,
+        "intent":            "VALIDATION",
+        "nouveau_ticket":    nouveau_ticket,
+        "documents_requis":  documents_requis if nouveau_ticket is None else [],
         "open_conversation": open_conv,
-    }
- 
- 
+    } 
 # ════════════════════════════════════════════════════════════════════
 #  ENDPOINT INFORMATION
 # ════════════════════════════════════════════════════════════════════
