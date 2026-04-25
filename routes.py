@@ -298,16 +298,9 @@ def post_answer(req: AnswerRequest):
 # ════════════════════════════════════════════════════════════════════
 #  ENDPOINT RÉCLAMATION (MODIFIÉ - supprimé type/montant)
 # ════════════════════════════════════════════════════════════════════
- 
 @router.post("/reclamation")
 def handle_reclamation(req: AnswerRequest):
-    """
-    Endpoint dédié aux réclamations.
-    - Crée UNIQUEMENT nouveau_ticket si toutes les infos sont prêtes
-    - Pas de ticket_update (supprimé)
-    - Une seule réclamation par message
-    """
-    import json
+    import json, re
     from service import (
         _llm_invoke_with_retry,
         _get_embeddings,
@@ -316,7 +309,7 @@ def handle_reclamation(req: AnswerRequest):
     )
     from langchain_core.messages import HumanMessage, SystemMessage
  
-    # ── Étape 1 : historique ────────────────────────────────────────
+    # ── Étape 1 : Historique ───────────────────────────────────────
     context_to_use = req.context[-5:] if len(req.context) > 5 else req.context
     lines = []
     for msg in context_to_use:
@@ -324,7 +317,7 @@ def handle_reclamation(req: AnswerRequest):
         lines.append(f"{role}: {msg.content}")
     historique = "\n".join(lines)
  
-    # ── Étape 2 : tickets existants ─────────────────────────────────
+    # ── Étape 2 : Tickets existants ────────────────────────────────
     tickets_list = getattr(req, "tickets", None) or []
     if tickets_list:
         tickets_lines = []
@@ -343,15 +336,148 @@ def handle_reclamation(req: AnswerRequest):
     else:
         tickets_section = "Tickets de réclamation existants du client : Aucun ticket existant."
  
-    # ── Étape 3 : open_conversation ─────────────────────────────────
+    # ── Étape 3 : Extraction sémantique LLM ───────────────────────
+    #
+    #  Trois champs retournés par le LLM :
+    #    - sujet_reclamation  : type/thème du problème
+    #    - description_detail : ce qui s'est passé (même court)
+    #    - info_suffisante    : true si le contexte global est assez clair
+    #                           pour créer le ticket sans poser de question
+    # ──────────────────────────────────────────────────────────────
+ 
+    SYSTEM_EXTRACT = (
+        "Tu es un extracteur d'informations bancaires. "
+        "Analyse la conversation et retourne UNIQUEMENT ce JSON strict, sans texte autour :\n"
+        "{\n"
+        '  "sujet_reclamation": "<valeur ou null>",\n'
+        '  "description_detail": "<valeur ou null>",\n'
+        '  "info_suffisante": true\n'
+        "}\n\n"
+ 
+        "Regles STRICTES :\n"
+        "- sujet_reclamation : le THEME ou TYPE du probleme du client.\n"
+        "  Exemples valides : 'solde Click incorrect', 'virement non recu',\n"
+        "  'carte bloquee', 'frais injustifies', 'probleme de connexion'.\n"
+        "  Retourner null si le client dit juste 'je veux faire une reclamation'\n"
+        "  sans preciser aucun sujet.\n"
+        "- description_detail : tout texte du client qui decrit ce qui s'est passe,\n"
+        "  meme une phrase tres courte ('mon virement n est pas arrive',\n"
+        "  'j ai ete debite deux fois').\n"
+        "  SOIS PERMISSIF : ne pas exiger de montant, de date ou de details supplementaires.\n"
+        "  Retourner null UNIQUEMENT si le client n a absolument rien decrit\n"
+        "  (ex : 'je veux faire une reclamation' sans aucun detail).\n"
+        "- info_suffisante : evalue l ENSEMBLE de la conversation (historique + message actuel).\n"
+        "  Mettre true si on comprend clairement QUEL est le probleme et CE QUI s est passe,\n"
+        "  meme sans montant ni date precise — suffisant pour ouvrir un dossier.\n"
+        "  Mettre false si le probleme reste flou ou si le client n a rien precise du tout.\n"
+        "  Exemples true  : 'mon virement de hier n est pas arrive',\n"
+        "                   'j ai ete debite deux fois ce matin',\n"
+        "                   'mon solde Click est incorrect depuis lundi'.\n"
+        "  Exemples false : 'je veux faire une reclamation',\n"
+        "                   'j ai un probleme', 'ca ne marche pas'.\n"
+        "- Si une valeur texte est absente : retourner null\n"
+        "  (JSON null, pas la string 'null', pas la string 'None').\n"
+        "- Ne jamais retourner une string contenant le mot 'null'."
+    )
+ 
+    extract_prompt = (
+        f"Historique de la conversation :\n{historique}\n\n"
+        f"Dernier message du client : {req.question}"
+    )
+ 
+    try:
+        raw_extract = _llm_invoke_with_retry([
+            SystemMessage(content=SYSTEM_EXTRACT),
+            HumanMessage(content=extract_prompt),
+        ]).content.strip()
+        if raw_extract.startswith("```"):
+            raw_extract = raw_extract.split("```")[1]
+            if raw_extract.startswith("json"):
+                raw_extract = raw_extract[4:]
+        extracted          = json.loads(raw_extract)
+        sujet_reclamation  = extracted.get("sujet_reclamation")
+        description_detail = extracted.get("description_detail")
+        info_suffisante    = bool(extracted.get("info_suffisante", False))
+ 
+        # Nettoyer les faux "null" string
+        if isinstance(sujet_reclamation, str) and sujet_reclamation.strip().lower() in ("null", "none", ""):
+            sujet_reclamation = None
+        if isinstance(description_detail, str) and description_detail.strip().lower() in ("null", "none", ""):
+            description_detail = None
+ 
+    except Exception:
+        sujet_reclamation  = None
+        description_detail = None
+        info_suffisante    = False
+ 
+    # ── Étape 4 : État des champs + statut global ──────────────────
+    #
+    #  dossier_complet = True si le LLM juge les infos suffisantes
+    #  (info_suffisante), indépendamment des champs null/non-null.
+    #  C'est ce flag qui commande la création du ticket.
+    # ──────────────────────────────────────────────────────────────
+    CHAMPS_REQUIS = ["sujet_reclamation", "description_detail"]
+ 
+    champs_deja_fournis = set()
+    if sujet_reclamation:
+        champs_deja_fournis.add("sujet_reclamation")
+    if description_detail:
+        champs_deja_fournis.add("description_detail")
+ 
+    champs_manquants = [c for c in CHAMPS_REQUIS if c not in champs_deja_fournis]
+ 
+    champ_labels = {
+        "sujet_reclamation":  f"sujet ({sujet_reclamation})"              if sujet_reclamation  else "sujet de la reclamation",
+        "description_detail": f"description ({description_detail[:60]}...)" if description_detail else "description du probleme",
+    }
+ 
+    # Statut injecté dans le prompt du LLM principal
+    if info_suffisante:
+        status_champs = (
+            f"Informations deja collectees : "
+            f"{', '.join(champ_labels[c] for c in champs_deja_fournis) if champs_deja_fournis else 'aucune'}\n"
+            f"Informations manquantes : aucune — dossier complet !\n"
+            f"[info_suffisante = TRUE — creer le ticket immediatement, ne pas poser de question]"
+        )
+    else:
+        status_champs = (
+            f"Informations deja collectees : "
+            f"{', '.join(champ_labels[c] for c in champs_deja_fournis) if champs_deja_fournis else 'aucune'}\n"
+            f"Informations manquantes : "
+            f"{', '.join(champ_labels[c] for c in champs_manquants) if champs_manquants else 'aucune — dossier complet !'}\n"
+            f"[info_suffisante = FALSE — poser une question sur ce qui manque]"
+        )
+ 
+    # ── Étape 5 : Détection de réclamations multiples ─────────────
+    SYSTEM_MULTI = (
+        "Analyse si le message contient PLUSIEURS reclamations DISTINCTES "
+        "(ex : probleme de virement ET probleme de carte). "
+        "IMPORTANT : donner le sujet ET les details d un meme probleme = "
+        "UNE SEULE reclamation, pas deux. "
+        'Reponds JSON strict : {"multiple_reclamations": true | false}'
+    )
+    try:
+        raw_multi = _llm_invoke_with_retry([
+            SystemMessage(content=SYSTEM_MULTI),
+            HumanMessage(content=req.question),
+        ]).content.strip()
+        if raw_multi.startswith("```"):
+            raw_multi = raw_multi.split("```")[1]
+            if raw_multi.startswith("json"):
+                raw_multi = raw_multi[4:]
+        is_multiple = json.loads(raw_multi).get("multiple_reclamations", False)
+    except Exception:
+        is_multiple = False
+ 
+    # ── Étape 6 : open_conversation ───────────────────────────────
     if not req.context:
         open_conv = False
     else:
         system_check = (
-            "Tu analyses si le nouveau message du client est lié à la conversation en cours. "
-            'Réponds UNIQUEMENT en JSON : {"open_conversation": true | false}'
+            "Analyse si le message est lie a la conversation en cours. "
+            'Reponds JSON : {"open_conversation": true | false}'
         )
-        user_check = f"Conversation :\n{historique}\n\nNouveau message : {req.question}"
+        user_check = f"Conversation :\n{historique}\n\nMessage : {req.question}"
         try:
             raw = _llm_invoke_with_retry([
                 SystemMessage(content=system_check),
@@ -365,9 +491,9 @@ def handle_reclamation(req: AnswerRequest):
         except Exception:
             open_conv = False
  
-    # ── Étape 4 : RAG ───────────────────────────────────────────────
+    # ── Étape 7 : RAG ─────────────────────────────────────────────
     q_vec = _get_embeddings().embed_query(req.question)
-    cur = _get_conn().cursor()
+    cur   = _get_conn().cursor()
     cur.execute(
         "SELECT content FROM documents ORDER BY embedding <-> %s::vector LIMIT 3;",
         (q_vec,),
@@ -376,51 +502,59 @@ def handle_reclamation(req: AnswerRequest):
     cur.close()
     context_docs = "\n\n".join(c for (c,) in rows)
  
-    # ── Étape 5 : PROMPT RÉCLAMATION MODIFIÉ ────────────────────────────────
-    SYSTEM_RECLAMATION = (
-        "Tu es Yasmine, conseillère BNM. Tu gères les RÉCLAMATIONS.\n\n"
+    # ── Étape 8 : Note demandes multiples ─────────────────────────
+    multiple_note = (
+        "\n ATTENTION : Le client envoie plusieurs reclamations distinctes. "
+        "Traiter UNIQUEMENT la premiere et lui demander d envoyer les autres separement.\n"
+        if is_multiple else ""
+    )
  
-        "Réponds STRICTEMENT en JSON :\n"
+    # ── Étape 9 : Prompt LLM principal ────────────────────────────
+    SYSTEM_RECLAMATION = (
+        "Tu es Yasmine, conseillere BNM. Tu geres les RECLAMATIONS.\n\n"
+ 
+        "Reponds STRICTEMENT en JSON :\n"
         "{\n"
-        '  "answer": "réponse au client",\n'
-        '  "nouveau_ticket": "description du ticket | null"\n'
+        '  "answer": "reponse au client",\n'
+        '  "nouveau_ticket": null\n'
         "}\n\n"
  
-        "═══ RÈGLES ═══\n\n"
+        "=== GESTION DES TICKETS EXISTANTS ===\n"
+        "Tu as acces a la liste complete des tickets de reclamation du client dans le prompt.\n"
+        "- Si le client demande le statut ou l avancement → reponds en te basant sur "
+        "  les tickets existants (titre, statut, date). Sois precis et naturel.\n"
+        "- Si un ticket existe deja pour la meme reclamation → ne pas creer de nouveau ticket, "
+        "  informer le client et lui communiquer le statut du ticket existant.\n"
+        "- Si aucun ticket existant → proceder a la collecte des informations.\n\n"
  
-        "1) UNE SEULE RÉCLAMATION PAR MESSAGE :\n"
-        "   - Si plusieurs réclamations, traiter la PREMIÈRE uniquement\n"
-        "   - Informer le client d'envoyer les autres séparément\n\n"
+        "REGLE ABSOLUE — CREATION DE TICKET\n"
+        "Tu te fies EXCLUSIVEMENT au flag [info_suffisante] dans le prompt.\n\n"
+        "CAS 1 — [info_suffisante = TRUE] :\n"
+        "  → nouveau_ticket = description courte et precise de la reclamation.\n"
+        "  → Ne pose AUCUNE question. Confirme la prise en charge directement.\n\n"
+        "CAS 2 — [info_suffisante = FALSE] :\n"
+        "  → nouveau_ticket = null.\n"
+        "  → Pose UNE question ciblée sur ce qui manque.\n"
+        "  → Ne redemande JAMAIS ce qui est deja dans 'Informations deja collectees'.\n\n"
  
-        "2) CRÉER UN TICKET UNIQUEMENT SI :\n"
-        "   - Le problème est CLAIR et PRÉCIS (le client a expliqué ce qui ne va pas)\n"
-        "   - Ce n'est pas un suivi de ticket existant\n"
-        "   - Le client n'est pas déjà en attente de documents\n\n"
+        "INTERDICTIONS ABSOLUES :\n"
+        "- Ne JAMAIS retourner la string 'null' ou '| null' dans nouveau_ticket.\n"
+        "- Ne JAMAIS creer un ticket si info_suffisante = FALSE.\n"
+        "- Ne JAMAIS poser une question si info_suffisante = TRUE.\n"
+        "- Ne JAMAIS redemander une information deja collectee.\n"
+        "- Ne JAMAIS rediriger le client vers le service client.\n"
+        "- Ne JAMAIS mentionner le mot 'ticket' dans la reponse au client.\n\n"
  
-        "3) NE PAS CRÉER DE TICKET SI :\n"
-        "   - Demande vague ('je veux faire une réclamation')\n"
-        "   - Ticket existe déjà sur le même sujet\n"
-        "   - Client est en attente de fournir des documents\n"
-        "   - C'est un simple suivi ('où en est ma réclamation ?')\n\n"
- 
-        "4) POUR ÊTRE EFFICACE :\n"
-        "   - Pose UNE SEULE question regroupant les informations nécessaires\n"
-        "   - Attends la réponse du client avant de créer le ticket\n"
-        "   - Ne demande pas systématiquement montant/date/type, sois adaptatif\n\n"
- 
-        "5) PAS DE ticket_update - Ce champ est SUPPRIMÉ\n"
-        "6) PAS DE pending_tickets - Ce champ est SUPPRIMÉ\n"
-        "7) QUAND TU CRÉES LE TICKET :\n"
-        "   - Il est FORMELLEMENT INTERDIT de dire 'j'ai créé un ticket' ou toute phrase contenant le mot 'ticket'\n"
-        "   - Il est FORMELLEMENT INTERDIT de dire 'consultez un conseiller' ou 'contactez le service client' ou toute phrase invitant le client à consulter un agent\n"
-        "   - La description dans nouveau_ticket doit être claire et précise, résumant le problème\n"
-        "   - Exemple de bonne description : 'Problème d'affichage du solde Click - client ne voit pas son solde'\n"
-        "   - Exemple de mauvaise description : 'réclamation client' (trop vague)\n"
+        "QUAND TOUT EST PRET (nouveau_ticket non null) :\n"
+        "- Confirmer chaleureusement la prise en charge de la reclamation.\n"
+        "- Mentionner un delai de traitement de 48 a 72 heures.\n"
+        "- Ne pas mentionner de ticket ni de conseiller.\n"
     )
  
     if open_conv:
         prompt = (
             f"{tickets_section}\n\n"
+            f"{status_champs}\n{multiple_note}\n"
             f"Historique :\n{historique}\n\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
@@ -428,42 +562,85 @@ def handle_reclamation(req: AnswerRequest):
     else:
         prompt = (
             f"{tickets_section}\n\n"
+            f"{status_champs}\n{multiple_note}\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
         )
  
-    # ── Étape 6 : appel LLM ─────────────────────────────────────────
+    # ── Étape 10 : Appel LLM ──────────────────────────────────────
     raw = _llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_RECLAMATION),
         HumanMessage(content=prompt),
     ]).content.strip()
  
-    # ── Étape 7 : parsing ───────────────────────────────────────────
+    # ── Étape 11 : Parsing + nettoyage des faux "null" string ─────
     try:
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        result = json.loads(raw)
-        answer = result.get("answer", "")
+        result         = json.loads(raw)
+        answer         = result.get("answer", "")
         nouveau_ticket = result.get("nouveau_ticket", None)
+ 
+        # Nettoyer les faux "null" string que le LLM genere parfois
+        if isinstance(nouveau_ticket, str):
+            cleaned = nouveau_ticket.strip().lower()
+            if (
+                cleaned in ("null", "none", "")
+                or cleaned.endswith("| null")
+                or cleaned.endswith("|null")
+                or "besoin de" in cleaned
+                or "manquant"  in cleaned
+                or "fournir"   in cleaned
+                or "veuillez"  in cleaned
+            ):
+                nouveau_ticket = None
+ 
     except Exception:
-        answer = raw
+        answer         = raw
         nouveau_ticket = None
  
-    # ── Étape 8 : fallback ──────────────────────────────────────────
+    # ── Étape 12 : Verrous Python — priorité absolue sur le LLM ───
+ 
+    # Verrou 1 : info pas suffisante selon le LLM → pas de ticket
+    if not info_suffisante:
+        nouveau_ticket = None
+ 
+    # Verrou 2 : demandes multiples → pas de ticket pour cette passe
+    elif is_multiple:
+        nouveau_ticket = None
+ 
+    # Safety net : info suffisante mais le LLM a oublie de creer le ticket
+    elif info_suffisante and nouveau_ticket is None:
+        sujet_val = sujet_reclamation or "reclamation"
+        desc_val  = (
+            (description_detail[:80] + "...")
+            if description_detail and len(description_detail) > 80
+            else (description_detail or "")
+        )
+        nouveau_ticket = f"{sujet_val} — {desc_val}"
+        if not answer:
+            answer = (
+                "Merci pour ces informations. Votre reclamation a bien ete prise en charge. "
+                "Notre equipe vous contactera dans les 48 a 72 heures."
+            )
+ 
+    # ── Étape 13 : Fallback ───────────────────────────────────────
     if _is_rag_weak(answer):
-        answer = "Je vous invite à contacter notre service client pour votre réclamation."
+        answer = (
+            "Pour traiter votre reclamation, pourriez-vous me preciser "
+            "le probleme rencontre ?"
+        )
  
     return {
-        "answer": answer,
-        "intent": "RECLAMATION",
-        "nouveau_ticket": nouveau_ticket,
+        "answer":            answer,
+        "intent":            "RECLAMATION",
+        "nouveau_ticket":    nouveau_ticket,
+        "champs_manquants":  champs_manquants if nouveau_ticket is None else [],
+        "info_suffisante":   info_suffisante,
         "open_conversation": open_conv,
-    }
- 
- 
-# ════════════════════════════════════════════════════════════════════
+    } 
 #  ENDPOINT VALIDATION (MODIFIÉ - numéro d'identité au lieu de photo)
 # ════════════════════════════════════════════════════════════════════
  
