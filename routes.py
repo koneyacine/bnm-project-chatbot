@@ -658,7 +658,9 @@ def handle_validation(req: AnswerRequest):
         _is_rag_weak,
     )
     from langchain_core.messages import HumanMessage, SystemMessage
- 
+
+
+
     # ── Étape 1 : Historique ───────────────────────────────────────
     context_to_use = req.context[-5:] if len(req.context) > 5 else req.context
     lines = []
@@ -808,12 +810,18 @@ def handle_validation(req: AnswerRequest):
         "  → Ne jamais mettre ce numéro dans numero_click même s'il a 8 chiffres.\n\n"
  
         "CAS 3 — doc_attendu = 'les_deux' ou 'aucun' :\n"
-        "  → NE PAS assigner de numéro à numero_click ni numero_identite.\n"
-        "  → Mettre les deux à null.\n"
-        "  → Mettre TOUS les numéros trouvés dans numeros_bruts (liste de strings).\n"
-        "  → Si le client utilise un mot-clé explicite ('click', 'NNI', 'identité', etc.)\n"
-        "    alors seulement tu peux assigner au bon champ.\n\n"
- 
+        "  → NE PAS assigner si le client ne précise pas la nature du numéro.\n"
+        "  → EXCEPTION : si le client utilise un mot-clé explicite\n"
+        "    ('click', 'num click', 'identité', 'num identite', 'NNI', 'CIN')\n"
+        "    → assigner OBLIGATOIREMENT au bon champ malgré doc_attendu.\n"  # ← ajouter
+        "  → Mettre dans numeros_bruts uniquement les numéros NON assignés.\n"
+  
+        "NETTOYAGE DES NUMÉROS :\n"
+        "  → Ignorer les espaces, tirets, points à l'intérieur des numéros.\n"
+        "  → '2 3', '2-3', '2.3' → traiter comme '23'.\n"
+        "  → Extraire uniquement les chiffres, ignorer tout le reste.\n"
+        "  → Un numéro collé à un mot ('est24', 'click23') → extraire '24', '23'.\n\n"
+
         "numeros_bruts : toujours lister tous les numéros trouvés dans le message,\n"
         "  qu'ils soient assignés ou non. Liste vide [] si aucun numéro.\n\n"
  
