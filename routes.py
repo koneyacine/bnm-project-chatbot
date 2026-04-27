@@ -688,29 +688,141 @@ def handle_validation(req: AnswerRequest):
         tickets_section = "Tickets de validation existants du client : Aucun ticket existant."
  
     # ── Étape 3 : Détection sémantique LLM des documents ──────────
-    SYSTEM_EXTRACT = (
-        "Tu es un extracteur d'informations bancaires. "
-        "Analyse le texte et retourne UNIQUEMENT ce JSON strict, sans texte autour :\n"
-        '{"numero_click": "<valeur ou null>", "numero_identite": "<valeur ou null>"}\n\n'
-        "Règles STRICTES :\n"
-        "- numero_click : numéro de téléphone Mobile Money/Click mauritanien. "
-        "  DOIT contenir EXACTEMENT 8 chiffres, commence souvent par 2, 3 ou 4. "
-        "  Tout numéro avec moins ou plus de 8 chiffres est INVALIDE = retourner null. "
-        "  Accepté : 'mon numéro', 'mon tel', 'click : XXXX', '22XXXXXXX'.\n"
-        "- numero_identite : NNI/CIN/passeport mauritanien. "
-        "  DOIT contenir EXACTEMENT 10 chiffres. "
-        "  Tout numéro avec moins ou plus de 10 chiffres est INVALIDE = retourner null. "
-        "  Doit être présenté comme pièce d'identité, carte nationale, CIN, NNI, passeport, "
-        "  OU être le deuxième numéro fourni si le contexte ne permet pas de distinguer.\n"
-        "- Si le contexte permet de distinguer les deux numéros, les assigner correctement.\n"
-        "- Si le contexte ne permet PAS de distinguer : le PREMIER numéro fourni = "
-        "  numero_click, le DEUXIÈME numéro fourni = numero_identite.\n"
-        "- Si la valeur n'est pas présente ou invalide : retourner null (JSON null, "
-        "  pas la string 'null', pas la string 'None').\n"
-        "- Ne jamais retourner une string contenant le mot 'null'."
+    #
+    # LOGIQUE EN 2 PASSES :
+    #
+    # PASSE A — Quel document le bot attendait-il ?
+    #   On regarde le dernier message du conseiller dans l'historique.
+    #   S'il demandait précisément le numéro click OU le numéro d'identité,
+    #   on le note → ça sert à interpréter la réponse ambiguë du client.
+    #
+    # PASSE B — Extraction enrichie
+    #   Retourne non seulement la valeur mais aussi si un numéro a été fourni
+    #   mais est invalide (pour que Yasmine puisse le dire naturellement).
+    #   Champs :
+    #     numero_click         : valeur valide ou null
+    #     numero_identite      : valeur valide ou null
+    #     click_invalide       : true si un numéro click a été fourni mais est invalide
+    #     identite_invalide    : true si un numéro identité a été fourni mais est invalide
+    #     doc_attendu_inconnu  : true si le client a fourni un numéro sans qu'on sache
+    #                            à quel champ il correspond ET le bot ne demandait rien
+    #                            de précis → il faut poser la question
+ 
+    # -- Passe A : contexte conversationnel complet --
+    #
+    # On récupère :
+    # 1. dernier_msg_conseiller → ce que le bot attendait
+    # 2. dernier_msg_client_precedent → le message client AVANT le message actuel
+    #    (utile si le client précise "c'est mon click" sans renvoyer le numéro)
+    #
+    dernier_msg_conseiller       = ""
+    dernier_msg_client_precedent = ""
+ 
+    for msg in reversed(context_to_use):
+        if msg.role != "client" and not dernier_msg_conseiller:
+            dernier_msg_conseiller = msg.content
+        elif msg.role == "client" and dernier_msg_conseiller and not dernier_msg_client_precedent:
+            dernier_msg_client_precedent = msg.content
+            break
+ 
+    SYSTEM_DOC_ATTENDU = (
+        "Tu analyses une conversation bancaire et tu retournes ce JSON strict, sans texte autour :\n"
+        "{\n"
+        '  "doc_attendu": "numero_click" | "numero_identite" | "les_deux" | "aucun",\n'
+        '  "numero_recupere": "<numéro brut ou null>"\n'
+        "}\n\n"
+        "doc_attendu — ce que le conseiller attendait dans son dernier message :\n"
+        "- 'numero_click'   : demandait le numéro Click / Mobile Money\n"
+        "- 'numero_identite': demandait la pièce d'identité / NNI / CIN / passeport\n"
+        "- 'les_deux'       : demandait les deux\n"
+        "- 'aucun'          : ne demandait aucun document précis\n\n"
+        "numero_recupere — UNIQUEMENT dans ce cas précis :\n"
+        "- Le conseiller avait demandé de PRÉCISER à quoi correspond un numéro\n"
+        "  (ex: 'est-ce votre click ou votre identité ?')\n"
+        "- ET le message actuel du client est une précision SANS nouveau numéro\n"
+        "  (ex: 'c est mon click', 'identité', 'c est pour le click')\n"
+        "- Dans ce cas : retourner le numéro brut trouvé dans le message client précédent.\n"
+        "- Dans TOUS les autres cas : retourner null.\n"
+        "- JSON null uniquement (pas la string 'null').\n"
     )
+ 
+    doc_attendu     = "aucun"
+    numero_recupere = None
+ 
+    if dernier_msg_conseiller:
+        try:
+            passe_a_prompt = (
+                f"Dernier message du conseiller : {dernier_msg_conseiller}\n\n"
+                f"Message client précédent : {dernier_msg_client_precedent or 'aucun'}\n\n"
+                f"Message actuel du client : {req.question}"
+            )
+            raw_da = _llm_invoke_with_retry([
+                SystemMessage(content=SYSTEM_DOC_ATTENDU),
+                HumanMessage(content=passe_a_prompt),
+            ]).content.strip()
+            if raw_da.startswith("```"):
+                raw_da = raw_da.split("```")[1]
+                if raw_da.startswith("json"):
+                    raw_da = raw_da[4:]
+            parsed_da       = json.loads(raw_da)
+            doc_attendu     = parsed_da.get("doc_attendu", "aucun")
+            numero_recupere = parsed_da.get("numero_recupere")
+            if isinstance(numero_recupere, str) and numero_recupere.strip().lower() in ("null", "none", ""):
+                numero_recupere = None
+        except Exception:
+            doc_attendu     = "aucun"
+            numero_recupere = None
+ 
+    # -- Passe B : extraction enrichie --
+    #
+    # RÈGLE FONDAMENTALE (corrige Bug 1 & 2) :
+    # ─────────────────────────────────────────
+    # Quand doc_attendu = "les_deux" ou "aucun" et que le client envoie un numéro
+    # sans mot-clé explicite → on NE devine PAS, on NE assigne PAS.
+    # On extrait juste le(s) numéro(s) brut(s) présents dans le message.
+    # C'est Python qui décidera quoi faire selon doc_attendu (voir après).
+    #
+    # Quand doc_attendu = "numero_click" ou "numero_identite" (bot attendait UN seul) :
+    # → le numéro fourni appartient à ce champ, valide ou invalide.
+    # → invalide = on le signale, on ne l'assigne pas à l'autre champ.
+ 
+    SYSTEM_EXTRACT = (
+        "Tu es un extracteur d'informations bancaires.\n"
+        "Analyse UNIQUEMENT le dernier message du client et retourne ce JSON strict :\n"
+        "{\n"
+        '  "numero_click": "<valeur brute ou null>",\n'
+        '  "numero_identite": "<valeur brute ou null>",\n'
+        '  "numeros_bruts": ["<num1>", "<num2>"]'
+        "}\n\n"
+ 
+        "Règles STRICTES selon doc_attendu fourni dans le prompt :\n\n"
+ 
+        "CAS 1 — doc_attendu = 'numero_click' :\n"
+        "  → Le numéro fourni par le client (même sans mot-clé) va dans numero_click.\n"
+        "  → numero_identite = null.\n"
+        "  → Ne jamais mettre ce numéro dans numero_identite même s'il a 10 chiffres.\n\n"
+ 
+        "CAS 2 — doc_attendu = 'numero_identite' :\n"
+        "  → Le numéro fourni par le client (même sans mot-clé) va dans numero_identite.\n"
+        "  → numero_click = null.\n"
+        "  → Ne jamais mettre ce numéro dans numero_click même s'il a 8 chiffres.\n\n"
+ 
+        "CAS 3 — doc_attendu = 'les_deux' ou 'aucun' :\n"
+        "  → NE PAS assigner de numéro à numero_click ni numero_identite.\n"
+        "  → Mettre les deux à null.\n"
+        "  → Mettre TOUS les numéros trouvés dans numeros_bruts (liste de strings).\n"
+        "  → Si le client utilise un mot-clé explicite ('click', 'NNI', 'identité', etc.)\n"
+        "    alors seulement tu peux assigner au bon champ.\n\n"
+ 
+        "numeros_bruts : toujours lister tous les numéros trouvés dans le message,\n"
+        "  qu'ils soient assignés ou non. Liste vide [] si aucun numéro.\n\n"
+ 
+        "Règle null : JSON null uniquement (pas la string 'null').\n"
+        "Ne retourne aucun texte en dehors du JSON."
+    )
+ 
     extract_prompt = (
-        f"Historique de la conversation :\n{historique}\n\n"
+        f"doc_attendu (ce que le bot attendait) : {doc_attendu}\n\n"
         f"Dernier message du client : {req.question}"
     )
     try:
@@ -722,30 +834,169 @@ def handle_validation(req: AnswerRequest):
             raw_extract = raw_extract.split("```")[1]
             if raw_extract.startswith("json"):
                 raw_extract = raw_extract[4:]
-        extracted       = json.loads(raw_extract)
-        numero_click    = extracted.get("numero_click")
-        numero_identite = extracted.get("numero_identite")
+        extracted        = json.loads(raw_extract)
+        numero_click     = extracted.get("numero_click")
+        numero_identite  = extracted.get("numero_identite")
+        numeros_bruts    = extracted.get("numeros_bruts") or []
         # Nettoyer les faux "null" string
         if isinstance(numero_click, str) and numero_click.strip().lower() in ("null", "none", ""):
             numero_click = None
         if isinstance(numero_identite, str) and numero_identite.strip().lower() in ("null", "none", ""):
             numero_identite = None
+        numeros_bruts = [str(n).strip() for n in numeros_bruts if str(n).strip()]
     except Exception:
-        numero_click    = None
+        numero_click   = None
         numero_identite = None
+        numeros_bruts  = []
  
-    # ── Validation stricte des formats côté Python (filet de sécurité) ──
-    # numero_click : exactement 8 chiffres
-    if numero_click is not None:
-        digits_click = re.sub(r'\D', '', str(numero_click))
-        if len(digits_click) != 8:
-            numero_click = None
+    # ── Injection numero_recupere (Passe A) dans numeros_bruts ───────
+    # Si le client a précisé "c'est mon click" sans renvoyer de numéro,
+    # la Passe A a récupéré le numéro brut du message précédent.
+    # On l'injecte ici pour que la validation Python puisse l'assigner.
+    if numero_recupere is not None and not numeros_bruts and numero_click is None and numero_identite is None:
+        nr = re.sub(r'\D', '', str(numero_recupere))
+        if nr:
+            numeros_bruts = [nr]
  
-    # numero_identite : exactement 10 chiffres
-    if numero_identite is not None:
-        digits_id = re.sub(r'\D', '', str(numero_identite))
-        if len(digits_id) != 10:
-            numero_identite = None
+ 
+    # ── Validation stricte des formats côté Python ────────────────
+    #
+    # BUG 1 & 2 CORRIGÉS ICI :
+    # Si doc_attendu est précis (un seul champ attendu) :
+    #   → on valide le numéro pour CE champ uniquement
+    #   → invalide = on signale UNIQUEMENT pour ce champ, jamais pour l'autre
+    #
+    # Si doc_attendu = "les_deux" ou "aucun" :
+    #   → on ne peut pas déterminer le champ → on pose la question au client
+    #   → on utilise numeros_bruts pour signaler qu'un numéro a été fourni
+    #     mais qu'on ne sait pas à quoi il correspond
+ 
+    click_invalide    = False
+    identite_invalide = False
+    numero_ambigu     = False   # True = numéro fourni mais champ inconnu → poser la question
+ 
+    if doc_attendu == "numero_click":
+        # Le numéro fourni appartient forcément au click
+        if numero_click is not None:
+            d = re.sub(r'\D', '', str(numero_click))
+            if len(d) != 8:
+                numero_click   = None
+                click_invalide = True
+        elif numeros_bruts:
+            # LLM n'a pas assigné mais un numéro brut existe → on tente
+            d = re.sub(r'\D', '', numeros_bruts[0])
+            if len(d) == 8:
+                numero_click = d
+            else:
+                click_invalide = True
+ 
+    elif doc_attendu == "numero_identite":
+        # Le numéro fourni appartient forcément à l'identité
+        if numero_identite is not None:
+            d = re.sub(r'\D', '', str(numero_identite))
+            if len(d) != 10:
+                numero_identite    = None
+                identite_invalide  = True
+        elif numeros_bruts:
+            d = re.sub(r'\D', '', numeros_bruts[0])
+            if len(d) == 10:
+                numero_identite = d
+            else:
+                identite_invalide = True
+ 
+    else:
+        # doc_attendu = "les_deux" ou "aucun"
+        # On accepte uniquement les numéros avec mot-clé explicite (déjà assignés par LLM)
+        if numero_click is not None:
+            d = re.sub(r'\D', '', str(numero_click))
+            if len(d) != 8:
+                numero_click   = None
+                click_invalide = True
+        if numero_identite is not None:
+            d = re.sub(r'\D', '', str(numero_identite))
+            if len(d) != 10:
+                numero_identite    = None
+                identite_invalide  = True
+        # Si des numéros bruts existent sans avoir été assignés → ambiguïté
+        if numeros_bruts and numero_click is None and numero_identite is None:
+            numero_ambigu = True   # bot doit poser la question, pas deviner
+ 
+    # -- Passe C : relecture cumulative de l'historique ─────────────
+    #
+    # BUG 3 CORRIGÉ :
+    # Ancienne version cherchait les numéros "confirmés explicitement" par le conseiller.
+    # Le conseiller ne répète jamais le numéro — il passe juste au document suivant.
+    #
+    # Nouvelle logique : on cherche les numéros fournis par le CLIENT dans l'historique
+    # passé, pour lesquels le bot N'A PAS redemandé de correction dans sa réponse suivante.
+    # = numéro fourni + bot a continué → numéro accepté implicitement.
+ 
+    SYSTEM_HISTORIQUE = (
+        "Tu es un extracteur d'informations bancaires.\n"
+        "Analyse l'historique d'une conversation TOUR PAR TOUR.\n"
+        "Identifie les numéros fournis par le CLIENT qui ont été ACCEPTÉS IMPLICITEMENT,\n"
+        "c'est-à-dire : le client a donné un numéro ET le bot n'a PAS demandé de le corriger\n"
+        "dans sa réponse immédiatement suivante (il a continué vers autre chose).\n\n"
+        "Retourne UNIQUEMENT ce JSON strict :\n"
+        '{"numero_click": "<8 chiffres valides ou null>", "numero_identite": "<10 chiffres valides ou null>"}\n\n'
+        "Règles :\n"
+        "- numero_click    : EXACTEMENT 8 chiffres, accepté implicitement par le bot.\n"
+        "- numero_identite : EXACTEMENT 10 chiffres, accepté implicitement par le bot.\n"
+        "- Si le bot a dit 'vérifiez', 'ressaisir', 'incorrect', 'invalide' après ce numéro → null.\n"
+        "- Si le numéro n'a pas été fourni ou n'est pas valide → null.\n"
+        "- JSON null uniquement (pas la string 'null').\n"
+    )
+ 
+    numero_click_hist    = None
+    numero_identite_hist = None
+ 
+    # On exclut le dernier message client (déjà traité par Passe B)
+    historique_precedent = context_to_use[:-1] if context_to_use else []
+    if historique_precedent:
+        lines_hist = []
+        for msg in historique_precedent:
+            role = "Client" if msg.role == "client" else "Conseiller BNM"
+            lines_hist.append(f"{role}: {msg.content}")
+        historique_txt = "\n".join(lines_hist)
+ 
+        try:
+            raw_hist = _llm_invoke_with_retry([
+                SystemMessage(content=SYSTEM_HISTORIQUE),
+                HumanMessage(content=f"Historique :\n{historique_txt}"),
+            ]).content.strip()
+            if raw_hist.startswith("```"):
+                raw_hist = raw_hist.split("```")[1]
+                if raw_hist.startswith("json"):
+                    raw_hist = raw_hist[4:]
+            extracted_hist       = json.loads(raw_hist)
+            numero_click_hist    = extracted_hist.get("numero_click")
+            numero_identite_hist = extracted_hist.get("numero_identite")
+            if isinstance(numero_click_hist, str) and numero_click_hist.strip().lower() in ("null", "none", ""):
+                numero_click_hist = None
+            if isinstance(numero_identite_hist, str) and numero_identite_hist.strip().lower() in ("null", "none", ""):
+                numero_identite_hist = None
+        except Exception:
+            numero_click_hist    = None
+            numero_identite_hist = None
+ 
+        # Validation Python de ce qui vient de l'historique
+        if numero_click_hist is not None:
+            d = re.sub(r'\D', '', str(numero_click_hist))
+            if len(d) != 8:
+                numero_click_hist = None
+        if numero_identite_hist is not None:
+            d = re.sub(r'\D', '', str(numero_identite_hist))
+            if len(d) != 10:
+                numero_identite_hist = None
+ 
+    # Fusion : tour actuel prioritaire, historique comble ce qui manque
+    if numero_click is None and numero_click_hist is not None:
+        numero_click   = numero_click_hist
+        click_invalide = False
+ 
+    if numero_identite is None and numero_identite_hist is not None:
+        numero_identite    = numero_identite_hist
+        identite_invalide  = False
  
     docs_deja_fournis = set()
     if numero_click:
@@ -755,6 +1006,36 @@ def handle_validation(req: AnswerRequest):
  
     DOCS_REQUIS    = ["numero_click", "numero_identite"]
     docs_manquants = [doc for doc in DOCS_REQUIS if doc not in docs_deja_fournis]
+ 
+    # ── Note d'invalidité / ambiguïté injectée dans le prompt ────────
+    invalidity_note = ""
+    if numero_ambigu:
+        if len(numeros_bruts) == 1:
+            invalidity_note += (
+                f"\n⚠️ NUMÉRO AMBIGU (1 seul numéro fourni : {numeros_bruts[0]}) : "
+                "le client a fourni UN SEUL numéro sans préciser à quoi il correspond. "
+                "Demande-lui simplement : est-ce son numéro Click ou son numéro d'identité ? "
+                "Ne parle PAS de 'deux numéros'. Ne demande PAS 'lequel est lequel'. "
+                "Il n'y a qu'un seul numéro — pose une question simple et claire.\n"
+            )
+        else:
+            invalidity_note += (
+                f"\n⚠️ NUMÉRO AMBIGU ({len(numeros_bruts)} numéros fournis : {', '.join(numeros_bruts)}) : "
+                "le client a fourni PLUSIEURS numéros sans préciser lequel est le Click et lequel est l'identité. "
+                "Demande-lui de préciser quel numéro correspond à son Click et quel numéro correspond à son identité.\n"
+            )
+    if click_invalide:
+        invalidity_note += (
+            "\n⚠️ NUMÉRO CLICK INVALIDE : le client a fourni un numéro click "
+            "mais il n'est pas correct. Demande-lui de vérifier et resaisir son numéro click "
+            "de façon naturelle, SANS mentionner de détails techniques.\n"
+        )
+    if identite_invalide:
+        invalidity_note += (
+            "\n⚠️ NUMÉRO D'IDENTITÉ INVALIDE : le client a fourni un numéro d'identité "
+            "mais il n'est pas correct. Demande-lui de vérifier et resaisir son numéro d'identité "
+            "de façon naturelle, SANS mentionner de détails techniques.\n"
+        )
  
     # ── Étape 4 : Détection de demandes multiples ─────────────────
     SYSTEM_MULTI = (
@@ -822,7 +1103,6 @@ def handle_validation(req: AnswerRequest):
         f"{', '.join(doc_labels[d] for d in docs_manquants) if docs_manquants else 'aucun - tout est prêt !'}"
     )
  
-    # Note demandes multiples — injectée dans le prompt ET utilisée comme verrou Python
     multiple_note = (
         "\n⚠️ Le client envoie plusieurs demandes. "
         "Traiter UNIQUEMENT la première et lui demander d'envoyer les autres séparément.\n"
@@ -830,6 +1110,7 @@ def handle_validation(req: AnswerRequest):
     )
  
     # ── Étape 8 : Prompt LLM ──────────────────────────────────────
+    # CHANGEMENTS 2, 3, 4 appliqués ici dans le system prompt
     SYSTEM_VALIDATION = (
         "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
  
@@ -855,10 +1136,23 @@ def handle_validation(req: AnswerRequest):
         "Si 'Documents manquants' = 'aucun - tout est prêt !' → "
         "nouveau_ticket = description courte et précise du dossier.\n\n"
  
-        "FORMATS VALIDES DES DOCUMENTS :\n"
-        "- numéro Click : exactement 8 chiffres.\n"
-        "- numéro d'identité : exactement 10 chiffres.\n"
-        "Si un numéro fourni ne respecte pas ces formats, demander au client de le corriger.\n\n"
+        "═══ GESTION DES NUMÉROS AMBIGUS ═══\n"
+        "Si le client fournit un ou plusieurs numéros SANS préciser leur nature "
+        "(click ou identité), demande-lui NATURELLEMENT de préciser quel numéro correspond à quoi. "
+        "Ne suppose JAMAIS. Ne devine JAMAIS. Pose une question claire et simple.\n\n"
+ 
+        "═══ RÈGLES DE COMMUNICATION ABSOLUES ═══\n"
+        # CHANGEMENT 2 : Interdire les détails techniques
+        "INTERDICTION TOTALE de mentionner :\n"
+        "- Le nombre de chiffres attendus (ni '8 chiffres', ni '10 chiffres', ni aucun chiffre)\n"
+        "- Des formats techniques ou des règles de validation\n"
+        "- Le mot 'format', 'chiffres', 'digits', 'caractères'\n\n"
+        # CHANGEMENT 3 : Correction naturelle en cas de numéro invalide
+        "SI UN NUMÉRO EST INVALIDE (détecté par le système) :\n"
+        "- Demande simplement au client de vérifier et resaisir son numéro, de façon naturelle.\n"
+        "- Exemples naturels : 'Pouvez-vous vérifier votre numéro Click ?' ou "
+        "  'Ce numéro ne semble pas correct, pourriez-vous le ressaisir ?'\n"
+        "- Ne donne JAMAIS d'indication sur ce qui est attendu techniquement.\n\n"
  
         "DOCUMENTS REQUIS : numero_click + numero_identite (les deux obligatoires).\n\n"
  
@@ -869,15 +1163,23 @@ def handle_validation(req: AnswerRequest):
         "- Ne JAMAIS rediriger le client vers le service client pour une validation.\n"
         "- Ne JAMAIS mentionner le mot 'ticket' dans la réponse au client.\n\n"
  
+        # CHANGEMENT 4 : Logique document-first claire
+        "LOGIQUE DE TRAITEMENT :\n"
+        "1. Vérifie 'Documents manquants' dans le prompt.\n"
+        "2. Si des documents manquent → demande UNIQUEMENT ce qui manque, "
+        "   sans répéter ce qui est déjà fourni.\n"
+        "3. Si tout est là → crée le ticket et remercie chaleureusement le client.\n\n"
+ 
         "QUAND TOUT EST PRÊT (nouveau_ticket non null) :\n"
         "- Confirmer chaleureusement la prise en charge.\n"
+        "- Remercier le client.\n"
         "- Mentionner un délai de traitement de 24 à 48 heures.\n"
     )
  
     if open_conv:
         prompt = (
             f"{tickets_section}\n\n"
-            f"{status_docs}\n{multiple_note}\n"
+            f"{status_docs}\n{multiple_note}{invalidity_note}\n"
             f"Historique :\n{historique}\n\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
@@ -885,7 +1187,7 @@ def handle_validation(req: AnswerRequest):
     else:
         prompt = (
             f"{tickets_section}\n\n"
-            f"{status_docs}\n{multiple_note}\n"
+            f"{status_docs}\n{multiple_note}{invalidity_note}\n"
             f"Base BNM :\n{context_docs}\n\n"
             f"Client : {req.question}"
         )
@@ -907,7 +1209,6 @@ def handle_validation(req: AnswerRequest):
         nouveau_ticket   = result.get("nouveau_ticket", None)
         documents_requis = result.get("documents_requis", docs_manquants)
  
-        # Nettoyer les faux "null" string que le LLM génère parfois
         if isinstance(nouveau_ticket, str):
             cleaned = nouveau_ticket.strip().lower()
             if (
@@ -946,16 +1247,17 @@ def handle_validation(req: AnswerRequest):
         )
         if not answer:
             answer = (
-                "Parfait ! J'ai bien reçu tous vos documents. "
-                "Votre demande de validation est en cours de traitement. "
-                "Vous recevrez une confirmation dans les 24 à 48 heures."
+                "Parfait ! J'ai bien reçu toutes vos informations. "
+                "Votre demande de validation est prise en charge. "
+                "Merci de votre confiance ! Vous recevrez une confirmation dans les 24 à 48 heures."
             )
  
     # ── Étape 12 : Fallback ───────────────────────────────────────
     if _is_rag_weak(answer):
         answer = (
-            "Pour valider votre compte Click, j'ai besoin de votre numéro Click "
-            "et de votre numéro d'identité nationale."
+            "Pour valider votre compte Click, j'aurais besoin de votre numéro Click "
+            "ainsi que de votre numéro d'identité nationale. "
+            "Pouvez-vous me les communiquer ?"
         )
  
     return {
@@ -964,8 +1266,7 @@ def handle_validation(req: AnswerRequest):
         "nouveau_ticket":    nouveau_ticket,
         "documents_requis":  documents_requis if nouveau_ticket is None else [],
         "open_conversation": open_conv,
-    } 
-# ════════════════════════════════════════════════════════════════════
+    }# ════════════════════════════════════════════════════════════════════
 #  ENDPOINT INFORMATION
 # ════════════════════════════════════════════════════════════════════
  
