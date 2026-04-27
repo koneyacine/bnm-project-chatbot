@@ -1047,12 +1047,15 @@ def handle_validation(req: AnswerRequest):
  
     # ── Étape 4 : Détection de demandes multiples ─────────────────
     SYSTEM_MULTI = (
-        "Analyse si le message contient PLUSIEURS demandes de validation DISTINCTES "
-        "(ex : valider compte A ET compte B, deux numéros Click différents). "
-        "IMPORTANT : donner son numéro de téléphone ET sa pièce d'identité = "
-        "UNE SEULE demande, pas deux. "
-        'Réponds JSON strict : {"multiple_validations": true | false}'
-    )
+    "Analyse si le message contient PLUSIEURS demandes de validation DISTINCTES "
+    "(ex : valider compte A ET compte B, deux numéros Click différents). "
+    "IMPORTANT : donner son numéro de téléphone ET sa pièce d'identité = "
+    "UNE SEULE demande, pas deux. "
+    "MAIS : si le client mentionne explicitement 'deux comptes', "
+    "'un compte... et lautre', 'deux validations' "
+    "→ c'est OBLIGATOIREMENT plusieurs demandes distinctes.\n"
+    'Réponds JSON strict : {"multiple_validations": true | false}'
+)
     try:
         raw_multi = _llm_invoke_with_retry([
             SystemMessage(content=SYSTEM_MULTI),
@@ -1065,7 +1068,12 @@ def handle_validation(req: AnswerRequest):
         is_multiple = json.loads(raw_multi).get("multiple_validations", False)
     except Exception:
         is_multiple = False
- 
+    # Après l'Étape 4, ajouter :
+    if is_multiple:
+     invalidity_note = ""
+     numero_ambigu = False
+     click_invalide = False
+     identite_invalide = False 
     # ── Étape 5 : open_conversation ───────────────────────────────
     if not req.context:
         open_conv = False
@@ -1087,7 +1095,8 @@ def handle_validation(req: AnswerRequest):
             open_conv = json.loads(raw).get("open_conversation", False)
         except Exception:
             open_conv = False
- 
+    print("is_multiple:", is_multiple)
+    print("raw_multi:", raw_multi)
     # ── Étape 6 : RAG ─────────────────────────────────────────────
     q_vec = _get_embeddings().embed_query(req.question)
     cur   = _get_conn().cursor()
@@ -1128,7 +1137,14 @@ def handle_validation(req: AnswerRequest):
         '  "nouveau_ticket": null,\n'
         '  "documents_requis": ["doc1"] | []\n'
         "}\n\n"
- 
+        
+        "🚨 RÈGLE PRIORITAIRE — DEMANDES MULTIPLES 🚨\n"
+        "Si le prompt contient '⚠️ Le client envoie plusieurs demandes' :\n"
+        "→ IGNORER tous les numéros présents dans le message.\n"
+        "→ IGNORER la gestion des numéros ambigus.\n"
+        "→ Répondre UNIQUEMENT que tu ne peux traiter qu'une demande à la fois.\n"
+        "→ Demander au client d'envoyer sa première demande séparément.\n\n"
+
         "═══ GESTION DES TICKETS EXISTANTS ═══\n"
         "Tu as accès à la liste complète des tickets de validation du client dans le prompt.\n"
         "- Si le client demande le statut ou l'avancement → réponds en te basant sur "
@@ -1205,7 +1221,8 @@ def handle_validation(req: AnswerRequest):
         SystemMessage(content=SYSTEM_VALIDATION),
         HumanMessage(content=prompt),
     ]).content.strip()
- 
+    
+    print("prompt complet:", prompt)
     # ── Étape 10 : Parsing + nettoyage des faux "null" string ─────
     try:
         if raw.startswith("```"):
