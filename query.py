@@ -45,7 +45,7 @@ for content, source in results:
 prompt = f"""
 You are an assistant that answers ONLY using the provided context about BNM.
 If the answer is not in the context, say you don't know.
-
+However, for salutations, you must respond politely and appropriately without saying "I don't know".
 Context:
 {context}
 
