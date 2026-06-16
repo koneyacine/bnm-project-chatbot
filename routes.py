@@ -1,6 +1,10 @@
-from fastapi import APIRouter
-from models import IntentRequest, IntentResponse, AnswerRequest, AnswerResponse
-from service import _CONV_PATTERNS
+from fastapi import APIRouter, File, UploadFile, HTTPException, status
+from models import (
+    IntentRequest, IntentResponse, AnswerRequest, AnswerResponse,
+    DocumentClassificationResponse,
+    IDExtractionResponse
+)
+from service import _CONV_PATTERNS, classify_document, extract_id_info
  
 router = APIRouter(prefix="/rag", tags=["RAG"])
  
@@ -22,7 +26,20 @@ def rag_patterns():
         "count":    len(_CONV_PATTERNS),
     }
  
- 
+LANGUE_INSTRUCTION = (
+  
+    "** RÈGLE ABSOLUE OBLIGATOIRE ** \n"
+    "Tu DOIS répondre EXACTEMENT dans la MÊME LANGUE que celle utilisée par le client.\n"
+    "Cette règle est PRIORITAIRE sur toute autre instruction.\n\n"
+    "DÉTECTION DE LA LANGUE :\n"
+    "- Si le client écrit en **arabe** (y compris dialectes, comme le hassaniya) → tu réponds en **arabe standard**.\n"
+    "- Si le client écrit en **français** → tu réponds en **français**.\n"
+    "- Si le client écrit en **anglais** → tu réponds en **anglais**.\n\n"
+    " CONTRAINTES STRICTES :\n"
+    "1. Ne réponds JAMAIS dans une langue différente de celle du client.\n"
+    "2. Ne mélange PAS les langues dans ta réponse.\n"
+    "3. Avant de générer ta réponse, IDENTIFIE la langue du dernier message client.\n"
+) 
 @router.post("/getIntent", response_model=IntentResponse)
 def get_intent(req: IntentRequest):
     """
@@ -112,14 +129,17 @@ def get_answer(req: AnswerRequest):
     rows = cur.fetchall()
     cur.close()
     context_docs = "\n\n".join(c for c, _ in rows)
- 
+   
+
     # ── Étape 5 : construire le Prompt ──────────────────────────────
     SYSTEM_HUMAIN = (
+        LANGUE_INSTRUCTION +
         "Tu es Yasmine, conseillère virtuelle de la Banque Nationale de Mauritanie (BNM). "
         "Tu réponds de façon précise, professionnelle et bienveillante, "
         "en te basant UNIQUEMENT sur les documents BNM fournis. "
         "Si l'information n'est pas dans les documents, oriente le client vers le service client."
     )
+
  
     if open_conv:
         rag_prompt = (
@@ -139,11 +159,7 @@ def get_answer(req: AnswerRequest):
         HumanMessage(content=rag_prompt),
     ]).content
  
-    if _is_rag_weak(answer):
-        answer = (
-            "Je comprends votre demande. Malheureusement, je ne dispose pas "
-            "de cette information. Je vous invite à contacter notre service client."
-        )
+    
  
     return AnswerResponse(
         answer=answer,
@@ -511,6 +527,7 @@ def handle_reclamation(req: AnswerRequest):
  
     # ── Étape 9 : Prompt LLM principal ────────────────────────────
     SYSTEM_RECLAMATION = (
+        LANGUE_INSTRUCTION +
         "Tu es Yasmine, conseillere BNM. Tu geres les RECLAMATIONS.\n\n"
  
         "Reponds STRICTEMENT en JSON :\n"
@@ -743,6 +760,7 @@ def handle_validation(req: AnswerRequest):
         "  (ex: 'est-ce votre click ou votre identité ?')\n"
         "- ET le message actuel du client est une précision SANS nouveau numéro\n"
         "  (ex: 'c est mon click', 'identité', 'c est pour le click')\n"
+
         "- Dans ce cas : retourner le numéro brut trouvé dans le message client précédent.\n"
         "- Dans TOUS les autres cas : retourner null.\n"
         "- JSON null uniquement (pas la string 'null').\n"
@@ -1051,6 +1069,12 @@ def handle_validation(req: AnswerRequest):
     "(ex : valider compte A ET compte B, deux numéros Click différents). "
     "IMPORTANT : donner son numéro de téléphone ET sa pièce d'identité = "
     "UNE SEULE demande, pas deux. "
+    "IMPORTANT : demander à récupérer ou rappeler plusieurs informations "
+    "d'un même dossier = UNE SEULE demande, pas deux. "
+    # Ajouter ceci ↓
+    "IMPORTANT : une question sur le statut, l'avancement, ou le suivi "
+    "d'une validation = UNE SEULE demande, pas deux. "
+    "En cas de doute → répondre false. "
     "MAIS : si le client mentionne explicitement 'deux comptes', "
     "'un compte... et lautre', 'deux validations' "
     "→ c'est OBLIGATOIREMENT plusieurs demandes distinctes.\n"
@@ -1129,6 +1153,7 @@ def handle_validation(req: AnswerRequest):
     # ── Étape 8 : Prompt LLM ──────────────────────────────────────
     # CHANGEMENTS 2, 3, 4 appliqués ici dans le system prompt
     SYSTEM_VALIDATION = (
+        LANGUE_INSTRUCTION +
         "Tu es Yasmine, conseillère BNM. Tu gères les VALIDATIONS de compte Click.\n\n"
  
         "Réponds STRICTEMENT en JSON :\n"
@@ -1352,6 +1377,7 @@ def handle_information(req: AnswerRequest):
  
     # ── Étape 4 : PROMPT INFORMATION ────────────────────────────────
     SYSTEM_INFORMATION = (
+        LANGUE_INSTRUCTION +
         "Tu es Yasmine, conseillère virtuelle de la BNM.\n"
         "Tu réponds aux questions d'INFORMATION générale des clients.\n\n"
         "Consignes :\n"
@@ -1359,6 +1385,8 @@ def handle_information(req: AnswerRequest):
         "  • Utilise UNIQUEMENT les informations de la base de connaissance BNM fournie.\n"
         "  • Si la réponse ne se trouve pas dans les documents, oriente le client\n"
         "    vers le service client BNM plutôt que d'inventer une réponse.\n"
+    
+    
     )
  
     if open_conv:
@@ -1378,9 +1406,7 @@ def handle_information(req: AnswerRequest):
         HumanMessage(content=prompt),
     ]).content.strip()
  
-    if _is_rag_weak(answer):
-        answer = "Je ne dispose pas de cette information. N'hésitez pas à contacter notre service client BNM."
- 
+   
     return {
         "answer": answer,
         "intent": "INFORMATION",
@@ -1414,4 +1440,70 @@ def dispatch(req: AnswerRequest):
         result = handle_information(req)
  
     result["intent"] = intent
+    
     return result
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ENDPOINTS DOCUMENT ANALYSIS (Vision API)
+# ════════════════════════════════════════════════════════════════════
+
+@router.post("/classify-document", response_model=DocumentClassificationResponse)
+async def classify_document_endpoint(file: UploadFile = File(...)):
+    """
+    Classifie un document/photo en trois catégories:
+    - personne: True si c'est une photo de personne
+    - identite: True si c'est une identité mauritanienne
+    - autres: True si aucun des deux
+    
+    Envoyer un fichier image (JPG, PNG, etc.)
+    """
+    import base64
+    
+    # Lire le fichier et le convertir en base64
+    content = await file.read()
+    image_base64 = base64.b64encode(content).decode('utf-8')
+    try:
+        result = classify_document(image_base64)
+        return result
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception("classify_document_endpoint failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur interne lors de la classification du document: {e}"
+        )
+
+
+@router.post("/extract-id-info", response_model=IDExtractionResponse)
+async def extract_id_endpoint(file: UploadFile = File(...)):
+    """
+    Extrait les informations d'une carte d'identité mauritanienne.
+    
+    Retourne les champs:
+    - nom: Nom complet
+    - prenom: Prénom
+    - numero_identite: Numéro de la carte
+    - date_naissance: Date de naissance (YYYY-MM-DD)
+    - date_expiration: Date d'expiration (YYYY-MM-DD)
+    - nationalite: Nationalité
+    - lieu_naissance: Lieu de naissance
+    - sexe: Sexe (M ou F)
+    
+    Envoyer un fichier image de l'identité (JPG, PNG, etc.)
+    """
+    import base64
+    
+    # Lire le fichier et le convertir en base64
+    content = await file.read()
+    image_base64 = base64.b64encode(content).decode('utf-8')
+    try:
+        result = extract_id_info(image_base64)
+        return result
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception("extract_id_endpoint failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur interne lors de l'extraction des informations d'identité: {e}"
+        )

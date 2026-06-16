@@ -50,4 +50,23 @@ class AnswerResponse(BaseModel):
     answer: str
     intent: str
     open_conversation: bool
+
+
+# ── Document Classification Response ───────────────────────────────
+class DocumentClassificationResponse(BaseModel):
+    personne: bool = Field(..., description="True si c'est une photo de personne")
+    identite: bool = Field(..., description="True si c'est une identité mauritanienne")
+    autres: bool = Field(..., description="True si aucun des deux")
+
+
+# ── ID Info Extraction Response ─────────────────────────────────────
+class IDExtractionResponse(BaseModel):
+    nom: Optional[str] = Field(None, description="Nom du titulaire")
+    prenom: Optional[str] = Field(None, description="Prénom du titulaire")
+    date_naissance: Optional[str] = Field(None, description="Date de naissance (YYYY-MM-DD)")
+    date_expiration: Optional[str] = Field(None, description="Date d'expiration (YYYY-MM-DD)")
+    numero_identite: Optional[str] = Field(None, description="Numéro d'identité")
+    nationalite: Optional[str] = Field(None, description="Nationalité")
+    lieu_naissance: Optional[str] = Field(None, description="Lieu de naissance")
+    sexe: Optional[str] = Field(None, description="Sexe (M/F)")
  

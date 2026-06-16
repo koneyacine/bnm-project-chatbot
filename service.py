@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 
-import openai
+from openai import OpenAI
 import psycopg2
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -45,10 +45,12 @@ def _get_conn():
     return _conn_global
 
 
+
 # ── LLM / Embeddings (initialisés au premier appel) ───────────────────────────
 
 _embeddings = None
 _llm = None
+_openai_client = None
 
 
 def _get_embeddings():
@@ -67,6 +69,14 @@ def _get_llm():
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         )
     return _llm
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        # OpenAI client reads OPENAI_API_KEY from env by default
+        _openai_client = OpenAI()
+    return _openai_client
 
 
 # ── Historique conversationnel ─────────────────────────────────────────────────
@@ -197,7 +207,7 @@ _CONV_PATTERNS: dict = {
         r"|confirmer\s*mon\s*compte|ouvrir\s*un\s*compte"
         r"|activer\s*mon\s*compte|v[eé]rifier\s*mon\s*compte)\b",
     ],
-    # Patterns conversationnels génériques
+    # Patterns convesationnels génériques
     "salutation": [
         r"\b(bonjour|bonsoir|salut|hello|salam|مرحبا|السلام)\b",
     ],
@@ -292,6 +302,38 @@ def _is_rag_weak(response: str) -> bool:
         return True
     lower = response.lower()
     return any(p in lower for p in _FALLBACK_PATTERNS)
+
+
+def _extract_json_from_text(text: str) -> str:
+    """Try to extract a JSON object from arbitrary assistant text.
+
+    Supports markdown code fences and raw JSON embedded in larger strings.
+    Raises ValueError if no JSON found.
+    """
+    import re
+    if not text:
+        raise ValueError("Empty response text")
+
+    # 1) Look for ```...``` fences (optionally starting with json)
+    # Use simple index search to handle escaped newlines (\n) inside repr strings
+    start = text.find("```")
+    if start != -1:
+        end = text.find("```", start + 3)
+        if end != -1 and end > start:
+            raw = text[start + 3:end]
+            # If the content contains literal '\n' sequences, unescape them
+            raw = raw.replace('\\n', '\n')
+            # If prefixed with 'json', strip it
+            if raw.lower().startswith('json'):
+                raw = raw[4:]
+            return raw.strip()
+
+    # 2) Fallback: find the first {...} JSON-like block
+    m2 = re.search(r"(\{[\s\S]*\})", text)
+    if m2:
+        return m2.group(1).strip()
+
+    raise ValueError("No JSON object found in text")
 
 
 def _llm_invoke_with_retry(prompt, max_retries: int = 1):
@@ -478,3 +520,182 @@ def process_question(
         "pipeline":   pipeline,
         "session_id": session_id,
     }
+
+
+# ── Document Classification (Vision API) ───────────────────────────────────────
+
+def classify_document(image_base64: str) -> dict:
+    """
+    Classifie un document/photo en trois catégories :
+    - personne: True si c'est une photo de personne
+    - identite: True si c'est une identité mauritanienne
+    - autres: True si aucun des deux
+    
+    Args:
+        image_base64: Image en format base64 (sans préfixe data:image/)
+    
+    Returns:
+        dict avec les champs: personne, identite, autres
+    """
+    try:
+        # Préparer le message pour OpenAI Vision
+        prompt = """Analyse cette image et classifie-la en répondant UNIQUEMENT en JSON :
+
+1. Est-ce une photo de personne (portrait, selfie, photo d'identité) ? → "personne"
+2. Est-ce une identité mauritanienne (Carte Nationale d'Identité) ? → "identite"
+3. Si aucun des deux → "autres"
+
+Réponds STRICTEMENT en JSON avec ce format (aucun autre texte) :
+{
+  "personne": true|false,
+  "identite": true|false,
+  "autres": true|false
+}
+
+RÈGLES :
+- Une identité mauritanienne est une carte beige/ocre avec les données personnelles visibles
+- Une photo de personne est tout portrait, selfie, ou photo du visage
+- Si c'est une identité mauritanienne → personne=false, identite=true, autres=false
+- Si c'est juste une photo de personne non-identité → personne=true, identite=false, autres=false
+- Si c'est autre chose (paysage, objet, document non-identité) → personne=false, identite=false, autres=true"""
+        
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ],
+                }
+            ],
+            max_tokens=200,
+        )
+
+        # Extract text from new OpenAI client response structure
+        try:
+            response_text = (
+                response.choices[0].message["content"][0]["text"].strip()
+            )
+        except Exception:
+            # Fallback to safer access
+            response_text = str(response)
+        
+        # Log raw response for debugging
+        logger.debug("OpenAI raw response (classify): %s", repr(response))
+        # Nettoyer si le texte contient du markdown
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+        logger.debug("OpenAI response_text (classify): %s", response_text)
+        try:
+            cleaned = _extract_json_from_text(response_text)
+            logger.debug("Extracted JSON text (classify): %r", cleaned)
+            result = json.loads(cleaned)
+        except Exception as e:
+            logger.error("Failed to parse JSON from OpenAI classify response: %s", e)
+            logger.error("Raw response_text was: %s", response_text)
+            raise
+        return {
+            "personne": bool(result.get("personne", False)),
+            "identite": bool(result.get("identite", False)),
+            "autres": bool(result.get("autres", False))
+        }
+    except Exception as e:
+        logger.error(f"Error classifying document: {e}")
+        return {
+            "personne": False,
+            "identite": False,
+            "autres": True
+        }
+
+
+def extract_id_info(image_base64: str) -> dict:
+    """
+    Extrait les informations d'une identité mauritanienne.
+    
+    Args:
+        image_base64: Image de l'identité en format base64
+    
+    Returns:
+        dict avec les champs: nom, prenom, date_naissance, date_expiration, 
+                              numero_identite, nationalite, lieu_naissance, sexe
+    """
+    try:
+        prompt = """Extrait les informations de cette carte d'identité mauritanienne.
+
+Réponds STRICTEMENT en JSON (aucun autre texte) :
+{
+  "nom": "NOM complet du titulaire" ou null,
+  "prenom": "PRENOM" ou null,
+  "numero_identite": "Numéro d'identité" ou null,
+  "date_naissance": "Date au format YYYY-MM-DD" ou null,
+  "date_expiration": "Date au format YYYY-MM-DD" ou null,
+  "nationalite": "Nationalité" ou null,
+  "lieu_naissance": "Lieu de naissance" ou null,
+  "sexe": "M ou F" ou null
+}
+
+INSTRUCTIONS IMPORTANTES :
+- Lis attentivement TOUS les champs de la carte (recto/verso si disponible)
+- Les dates doivent être au format YYYY-MM-DD
+- Si un champ n'est pas visible ou illisible, mets null
+- Sépare le nom et le prénom si possible
+- Le sexe doit être "M" ou "F" ou null"""
+        
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ],
+                }
+            ],
+            max_tokens=300,
+        )
+
+        logger.debug("OpenAI raw response (extract): %s", repr(response))
+        try:
+            response_text = response.choices[0].message["content"][0]["text"].strip()
+        except Exception:
+            response_text = str(response)
+        
+        logger.debug("OpenAI response_text (extract): %s", response_text)
+        try:
+            cleaned = _extract_json_from_text(response_text)
+            logger.debug("Extracted JSON text (extract): %r", cleaned)
+            result = json.loads(cleaned)
+        except Exception as e:
+            logger.error("Failed to parse JSON from OpenAI extract response: %s", e)
+            logger.error("Raw response text was: %s", response_text)
+            raise
+        
+        return {
+            "nom": result.get("nom"),
+            "prenom": result.get("prenom"),
+            "numero_identite": result.get("numero_identite"),
+            "date_naissance": result.get("date_naissance"),
+            "date_expiration": result.get("date_expiration"),
+            "nationalite": result.get("nationalite"),
+            "lieu_naissance": result.get("lieu_naissance"),
+            "sexe": result.get("sexe")
+        }
+    except Exception as e:
+        logger.error(f"Error extracting ID info: {e}")
+        return {
+            "nom": None,
+            "prenom": None,
+            "numero_identite": None,
+            "date_naissance": None,
+            "date_expiration": None,
+            "nationalite": None,
+            "lieu_naissance": None,
+            "sexe": None
+        }
