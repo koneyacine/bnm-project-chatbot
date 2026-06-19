@@ -18,6 +18,8 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+import session_store
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -526,39 +528,42 @@ def process_question(
 
 def classify_document(image_base64: str) -> dict:
     """
-    Classifie un document/photo en trois catégories :
-    - personne: True si c'est une photo de personne
+    Classifie un document/photo :
+    - selfie: True si c'est un selfie ou portrait où un visage humain est clairement visible
+    - personne: True si c'est une photo de personne (portrait, selfie)
     - identite: True si c'est une identité mauritanienne
     - autres: True si aucun des deux
-    
-    Args:
-        image_base64: Image en format base64 (sans préfixe data:image/)
-    
-    Returns:
-        dict avec les champs: personne, identite, autres
     """
     try:
-        # Préparer le message pour OpenAI Vision
         prompt = """Analyse cette image et classifie-la en répondant UNIQUEMENT en JSON :
 
-1. Est-ce une photo de personne (portrait, selfie, photo d'identité) ? → "personne"
-2. Est-ce une identité mauritanienne (Carte Nationale d'Identité) ? → "identite"
-3. Si aucun des deux → "autres"
+1. Est-ce un selfie ou un portrait où le visage d'une personne est clairement visible en premier plan ? → "selfie"
+2. Est-ce une photo de personne (portrait, selfie, photo du visage) ? → "personne"
+3. Est-ce une identité mauritanienne (Carte Nationale d'Identité mauritanienne) ? → "identite"
+4. Est-ce une pièce d'identité NON mauritanienne (passeport étranger, carte d'identité étrangère, permis de conduire étranger, etc.) ? → "identite_non_valide"
+5. Si aucun des deux → "autres"
 
 Réponds STRICTEMENT en JSON avec ce format (aucun autre texte) :
 {
+  "selfie": true|false,
   "personne": true|false,
   "identite": true|false,
+  "identite_non_valide": true|false,
   "autres": true|false
 }
 
 RÈGLES :
-- Une identité mauritanienne est une carte beige/ocre avec les données personnelles visibles
+- "selfie" = true UNIQUEMENT si un visage humain est nettement visible et au premier plan (selfie, portrait, photo d'identité avec visage)
+- "selfie" = false si la personne est de dos, trop loin, floue, ou si le visage n'est pas visible
+- "identite" = true UNIQUEMENT si c'est la Carte Nationale d'Identité mauritanienne (carte beige/ocre avec données en arabe et français, drapeau mauritanien)
+- "identite_non_valide" = true si c'est une pièce d'identité d'un autre pays (passeport étranger, CNI étrangère, permis de conduire étranger, carte de séjour, etc.)
 - Une photo de personne est tout portrait, selfie, ou photo du visage
-- Si c'est une identité mauritanienne → personne=false, identite=true, autres=false
-- Si c'est juste une photo de personne non-identité → personne=true, identite=false, autres=false
-- Si c'est autre chose (paysage, objet, document non-identité) → personne=false, identite=false, autres=true"""
-        
+- Si c'est une CNI mauritanienne → identite=true, identite_non_valide=false, selfie=false, personne=false, autres=false
+- Si c'est une pièce d'identité étrangère → identite=false, identite_non_valide=true, selfie=false, personne=false, autres=false
+- Si c'est un selfie/portrait (visage visible) → selfie=true, personne=true, identite=false, identite_non_valide=false, autres=false
+- Si c'est une photo de personne sans visage visible → selfie=false, personne=true, identite=false, identite_non_valide=false, autres=false
+- Si c'est autre chose (paysage, objet, document non-identité) → selfie=false, personne=false, identite=false, identite_non_valide=false, autres=true"""
+
         client = _get_openai_client()
         response = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -567,51 +572,54 @@ RÈGLES :
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                        }
                     ],
                 }
             ],
             max_tokens=200,
         )
 
-        # Extract text from new OpenAI client response structure
-        try:
-            response_text = (
-                response.choices[0].message["content"][0]["text"].strip()
-            )
-        except Exception:
-            # Fallback to safer access
-            response_text = str(response)
-        
-        # Log raw response for debugging
-        logger.debug("OpenAI raw response (classify): %s", repr(response))
+        # ── Extraction correcte pour le nouveau client OpenAI ──────
+        response_text = response.choices[0].message.content.strip()
+
+        logger.debug("OpenAI response_text (classify): %r", response_text)
+
         # Nettoyer si le texte contient du markdown
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
                 response_text = response_text[4:]
-        logger.debug("OpenAI response_text (classify): %s", response_text)
+
+        # Parser le JSON
         try:
             cleaned = _extract_json_from_text(response_text)
-            logger.debug("Extracted JSON text (classify): %r", cleaned)
+            logger.debug("Extracted JSON (classify): %r", cleaned)
             result = json.loads(cleaned)
         except Exception as e:
-            logger.error("Failed to parse JSON from OpenAI classify response: %s", e)
-            logger.error("Raw response_text was: %s", response_text)
+            logger.error("Failed to parse JSON from classify response: %s", e)
+            logger.error("response_text was: %r", response_text)
             raise
+
         return {
-            "personne": bool(result.get("personne", False)),
-            "identite": bool(result.get("identite", False)),
-            "autres": bool(result.get("autres", False))
-        }
-    except Exception as e:
-        logger.error(f"Error classifying document: {e}")
-        return {
-            "personne": False,
-            "identite": False,
-            "autres": True
+            "selfie":               bool(result.get("selfie",               False)),
+            "personne":             bool(result.get("personne",             False)),
+            "identite":             bool(result.get("identite",             False)),
+            "identite_non_valide":  bool(result.get("identite_non_valide",  False)),
+            "autres":               bool(result.get("autres",               False)),
         }
 
+    except Exception as e:
+        logger.error("Error classifying document: %s", e)
+        return {
+            "selfie":               False,
+            "personne":             False,
+            "identite":             False,
+            "identite_non_valide":  False,
+            "autres":               True,
+        }
 
 def extract_id_info(image_base64: str) -> dict:
     """
